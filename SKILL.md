@@ -1,6 +1,6 @@
 ---
 name: pocket48-replays
-description: Query, inspect, and download Pocket48/口袋48 live & radio recordings, danmaku, and metadata for 48-group members. Defaults to 谭思慧. Supports --dry-run to preview, --info-only for full metadata, --download-danmaku for LRC danmaku files, and --live-type to filter by type (直播/电台/游戏/AI).
+description: Query, inspect, and download Pocket48/口袋48 live & radio recordings, danmaku, and metadata for 48-group members. Defaults to 谭思慧. Supports --dry-run to preview, --info-only for full metadata, --download-danmaku for LRC danmaku files, --live-type filter, --group-id team filter, and --proxy for API proxy.
 ---
 
 # Pocket48 Replays
@@ -13,7 +13,7 @@ This skill provides a script (`scripts/download_pocket48_lives.mjs`) to interact
 - **Download** video/audio streams as `.ts` files (default behavior)
 - **Download** LRC danmaku (弹幕) files
 - **Save** full metadata JSON for each recording
-- **Filter** by live type (直播/电台/游戏/AI)
+- **Filter** by live type (直播/电台/游戏/AI) and team (groupId)
 
 **Defaults:** `--member` defaults to `谭思慧`, `--since` defaults to 7 days ago.
 
@@ -41,25 +41,26 @@ node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_poc
   --download-all
 ```
 
-### Preview (dry-run) with metadata
+### Preview (dry-run)
 
 ```bash
 node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_pocket48_lives.mjs \
   --dry-run
 ```
 
-### Filter by type: only radio (电台)
+### Filter by team (CGT48)
+
+```bash
+node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_pocket48_lives.mjs \
+  --group-id 21 \
+  --info-only
+```
+
+### Filter by live type: only radio (电台)
 
 ```bash
 node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_pocket48_lives.mjs \
   --live-type 2
-```
-
-### Filter by type: live + radio
-
-```bash
-node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_pocket48_lives.mjs \
-  --live-type 1,2
 ```
 
 ### Output as JSON
@@ -69,16 +70,14 @@ node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_poc
   --json
 ```
 
-### Download with custom time range
+### Use msg48.org as proxy
 
 ```bash
 node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_pocket48_lives.mjs \
-  --member '谭思慧' \
-  --since '2026-06-01 00:00:00' \
-  --concurrency 2
+  --proxy https://msg48.org/api/live
 ```
 
-### Download danmaku only (no video)
+### Download danmaku only
 
 ```bash
 node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_pocket48_lives.mjs \
@@ -92,6 +91,8 @@ node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_poc
 | `--member NAME` | Member name, default "谭思慧" |
 | `--since 'YYYY-MM-DD HH:mm:ss'` | Start time, default 7 days ago |
 | `--user-id ID` | Pocket48 userId (skip auto-lookup) |
+| `--group-id N` | Filter by team (10=SNH48, 21=CGT48, 12=GNZ48, etc.) |
+| `--proxy URL` | Use API proxy to avoid rate limiting (e.g. `https://msg48.org/api/live`) |
 | `--out-root DIR` | Output directory |
 | `--concurrency N` | Parallel downloads, default 1 |
 | `--info-only` | Show all metadata fields, no download |
@@ -105,16 +106,28 @@ node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_poc
 
 ## Metadata fields shown (--info-only)
 
-- Live ID, Type (直播/电台/游戏/AI), Title
-- Announcement (公告/计分规则说明)
-- Member name, avatar, team
-- Start time, end time, creation time
-- Watch count (onlineNum), play count (playNum)
-- Status, roomId, liveMode
-- M3U8 playback URL (playStreamPath)
-- LRC danmaku URL (msgFilePath)
-- Cover image URL (coverPath)
-- In-microphone connection flag
+- **Live ID** — unique identifier
+- **类型** — 直播/电台/游戏/AI
+- **时间** — recording start time
+- **时长** — formatted duration (from API)
+- **标题** — short title set by streamer
+- **公告** — full announcement/scoring rules (long text)
+- **成员** — member nickname
+- **真实姓名** — real name (starName)
+- **等级** — user level
+- **身份** — roles (明星成员/VIP/偶像)
+- **粉丝数** — followers count
+- **签名** — personal signature
+- **观看人数** — onlineNum (viewers)
+- **播放次数** — play count
+- **状态** — status code
+- **封面尺寸** — cover image dimensions
+- **liveMode** — 0=正常, 1=录屏
+- **连麦中 / PK连麦** — microphone connection status
+- **房间ID** — room ID
+- **M3U8** — video stream URL
+- **弹幕文件** — LRC danmaku URL
+- **封面** — cover image URL
 
 ## Built-in member lookup
 
@@ -129,3 +142,5 @@ The script has a built-in table (`KNOWN_MEMBERS`). To add members, edit the map 
 - Metadata JSON is always saved alongside downloads
 - Danmaku files are in standard LRC format, one line per danmaku
 - `--concurrency 2-3` practical range for parallel downloads
+- `--group-id` overrides the member filter to team-wide scope (useful for browsing)
+- `--proxy` switches API calls to a proxy endpoint (e.g. msg48.org) to bypass rate limits

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 const OFFICIAL_API = 'https://pocketapi.48.cn/live/api/v1/live';
-const MSG48_API = 'https://msg48.org/api';
+const MSG48_API = 'https://msg48.org/api/live';
 const DEFAULT_OUT_ROOT = '/Users/cbj/Documents/48';
 const DEFAULT_MEMBER_SOURCE = '/private/tmp/roomId.json';
 const USER_AGENT = 'PocketFans201807/6.0.16 (iPhone; iOS 13.5.1; Scale/2.00)';
@@ -21,6 +21,25 @@ const LIVE_TYPE_LABELS = {
   6: 'AI',
 };
 
+const GROUP_ID_MAP = {
+  0: '全部',
+  10: 'SNH48',
+  11: 'BEJ48',
+  12: 'GNZ48',
+  14: 'CKG48',
+  21: 'CGT48',
+  15: 'IDFT',
+  19: '明星殿堂',
+  17: 'THE9',
+  18: '硬糖少女303',
+  20: '丝芭影视',
+  16: '海外练习生',
+};
+
+const USER_ROLE_LABELS = {
+  3: '偶像',
+};
+
 function usage() {
   console.error(`Usage: node download_pocket48_lives.mjs [options]
 
@@ -28,18 +47,20 @@ Options:
   --member NAME              Member name, default "谭思慧"
   --since 'YYYY-MM-DD HH:mm:ss'  Start time, default 7 days ago
   --user-id ID               Pocket48 userId; skips member-source lookup
+  --group-id N               Filter by team (10=SNH48, 21=CGT48, etc.)
+  --proxy URL                Use API proxy (e.g. https://msg48.org/api/live)
   --out-root DIR             Output root, default ${DEFAULT_OUT_ROOT}
   --member-source FILE       roomId.json source, default ${DEFAULT_MEMBER_SOURCE}
   --ffmpeg PATH              ffmpeg binary, default auto-detect
   --ffprobe PATH             ffprobe binary, default auto-detect
   --max-pages N              Max getLiveList pages, default 20
   --concurrency N            Parallel ffmpeg downloads, default 1; recommend 2-3
-  --info-only                Show all metadata (JSON) for selected recordings, no download
+  --info-only                Show all metadata for selected recordings, no download
   --download-video           Download video/audio stream (default: true)
   --download-danmaku         Download LRC danmaku files
   --download-all             Download video + danmaku + metadata JSON
-  --live-type N              Filter by live type: 1=直播, 2=电台, 5=游戏, 6=AI (comma-separated)
-  --json                     Output metadata as JSON (implies --info-only unless --download-* given)
+  --live-type N              Filter by type: 1=直播, 2=电台, 5=游戏, 6=AI (comma-sep)
+  --json                     Output metadata as JSON
   --dry-run                  List selected recordings without downloading
 `);
 }
@@ -56,6 +77,7 @@ function parseArgs(argv) {
     downloadVideo: true,
     downloadDanmaku: false,
     json: false,
+    groupId: '0',
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -122,6 +144,10 @@ function defaultFfprobe() {
   return 'ffprobe';
 }
 
+function apiBase(opts) {
+  return opts.proxy || OFFICIAL_API;
+}
+
 function pocketHeaders() {
   return {
     'Content-Type': 'application/json;charset=utf-8',
@@ -141,20 +167,26 @@ function pocketHeaders() {
   };
 }
 
-async function postJson(url, body) {
-  const res = await fetch(url, { method: 'POST', headers: pocketHeaders(), body: JSON.stringify(body) });
+function proxyHeaders() {
+  return { 'Content-Type': 'application/json;charset=utf-8' };
+}
+
+async function postJson(url, body, useProxy) {
+  const headers = useProxy ? proxyHeaders() : pocketHeaders();
+  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
   if (!res.ok) throw new Error(`${url} HTTP ${res.status}`);
   const json = await res.json();
   if (!json.success) throw new Error(`${url} API error: ${json.message || JSON.stringify(json)}`);
   return json.content;
 }
 
-async function searchMemberViaApi(member, maxPages = 5) {
+async function searchMemberViaApi(member, opts, maxPages = 5) {
+  const base = apiBase(opts);
   let next = '0';
   for (let page = 1; page <= maxPages; page++) {
     let content;
     try {
-      content = await postJson(`${OFFICIAL_API}/getLiveList`, { userId: '0', next });
+      content = await postJson(`${base}/getLiveList`, { userId: '0', next }, !!opts.proxy);
     } catch (e) {
       console.error(`API search page ${page} failed: ${e.message}`);
       return null;
@@ -198,7 +230,7 @@ async function resolveUserId(opts) {
   } catch {}
 
   console.log(`SEARCH ${opts.member} via API...`);
-  const apiId = await searchMemberViaApi(opts.member);
+  const apiId = await searchMemberViaApi(opts.member, opts);
   if (apiId) {
     console.log(`LOOKUP ${opts.member} -> userId=${apiId} (API search)`);
     return apiId;
@@ -207,12 +239,15 @@ async function resolveUserId(opts) {
   throw new Error(`Cannot resolve member "${opts.member}". Use --user-id to specify the Pocket48 userId directly.`);
 }
 
-async function fetchLiveList(userId, sinceMs, maxPages, liveTypeFilter) {
+async function fetchLiveList(userId, sinceMs, opts) {
   const selected = [];
   let next = '0';
-  const typeSet = liveTypeFilter ? new Set(liveTypeFilter.split(',').map(Number)) : null;
-  for (let page = 1; page <= maxPages; page++) {
-    const content = await postJson(`${OFFICIAL_API}/getLiveList`, { userId, next });
+  const base = apiBase(opts);
+  const typeSet = opts.liveType ? new Set(opts.liveType.split(',').map(Number)) : null;
+  for (let page = 1; page <= opts.maxPages; page++) {
+    const body = { userId, next };
+    if (opts.groupId !== '0') body.groupId = Number(opts.groupId);
+    const content = await postJson(`${base}/getLiveList`, body, !!opts.proxy);
     const lives = content.liveList || [];
     if (!lives.length) break;
     for (const live of lives) {
@@ -230,8 +265,9 @@ async function fetchLiveList(userId, sinceMs, maxPages, liveTypeFilter) {
   return selected.sort((a, b) => Number(a.ctime) - Number(b.ctime));
 }
 
-async function getLiveOne(liveId) {
-  return postJson(`${OFFICIAL_API}/getLiveOne`, { liveId: String(liveId) });
+async function getLiveOne(liveId, opts) {
+  const base = apiBase(opts);
+  return postJson(`${base}/getLiveOne`, { liveId: String(liveId) }, !!opts.proxy);
 }
 
 function run(bin, args, opts = {}) {
@@ -268,24 +304,42 @@ async function mapLimit(items, limit, mapper) {
 function formatLiveRecord(live, detail) {
   const liveType = live.liveType ?? detail?.liveType;
   const typeLabel = LIVE_TYPE_LABELS[liveType] || `未知(${liveType})`;
+  const ui = live.userInfo;
+  const du = detail?.user;
+
+  const roles = [];
+  if (ui?.isStar || du?.isStar) roles.push('明星成员');
+  if (ui?.vip || du?.vip) roles.push('VIP');
+  const roleLabel = roles.length ? roles.join(' · ') : (ui?.userRole ? (USER_ROLE_LABELS[ui.userRole] || `角色${ui.userRole}`) : '?');
+
+  const coverPath = live.coverPath || detail?.coverPath || '';
+  const coverUrl = coverPath ? `https://source.48.cn${coverPath.startsWith('/') ? '' : '/'}${coverPath}` : '(无)';
+  const dims = (live.coverWidth && live.coverHeight) ? `${live.coverWidth}×${live.coverHeight}` : null;
+
   const lines = [
     `  Live ID:     ${live.liveId}`,
     `  类型:        ${typeLabel}`,
     `  时间:        ${displayTime(live.ctime)}`,
+    `  时长:        ${live.duration || '(未知)'}`,
     `  标题:        ${detail?.title || live.title || '(无标题)'}`,
-    `  公告:        ${detail?.announcement || '(无)'}`,
-    `  成员:        ${live.userInfo?.nickname || detail?.user?.userName || '?'}`,
+    `  公告:        ${detail?.announcement || live.announcement || '(无)'}`,
+    `  成员:        ${ui?.nickname || du?.userName || '?'}`,
+    `  真实姓名:    ${ui?.starName || '?'}`,
+    `  等级:        ${ui?.level ?? du?.level ?? '?'}`,
+    `  身份:        ${roleLabel}`,
+    `  粉丝数:      ${ui?.followers ?? '?'}`,
+    `  签名:        ${ui?.signature || '(无)'}`,
     `  观看人数:    ${live.onlineNum ?? detail?.onlineNum ?? '?'}`,
     `  播放次数:    ${live.playNum ?? detail?.playNum ?? '?'}`,
     `  状态:        ${live.status ?? detail?.status ?? '?'}`,
+    `  封面尺寸:    ${dims || '(未知)'}`,
+    `  liveMode:    ${live.liveMode ?? detail?.liveMode ?? '?'}`,
+    `  连麦中:      ${live.inMicrophoneConnection ?? detail?.inMicrophoneConnection ?? '?'}`,
+    `  PK连麦:      ${live.inMicrophonePkConnection ?? '?'}`,
+    `  房间ID:      ${live.roomId ?? detail?.roomId ?? '?'}`,
     `  M3U8:        ${detail?.playStreamPath || '(无)'}`,
     `  弹幕文件:    ${detail?.msgFilePath || '(无)'}`,
-    `  封面:        ${live.coverPath ? `https://source.48.cn/${live.coverPath}` : detail?.coverPath ? `https://source.48.cn/${detail.coverPath}` : '(无)'}`,
-    `  开始时间:    ${live.stime ? displayTime(live.stime) : detail?.stime ? displayTime(detail.stime) : '?'}`,
-    `  结束时间:    ${live.endTime ? displayTime(live.endTime) : detail?.endTime ? displayTime(detail.endTime) : '?'}`,
-    `  房间ID:      ${live.roomId ?? detail?.roomId ?? '?'}`,
-    `  liveMode:    ${live.liveMode ?? detail?.liveMode ?? '?'}`,
-    `  连麦中:      ${detail?.inMicrophoneConnection ?? '?'}`,
+    `  封面:        ${coverUrl}`,
   ];
   return lines.join('\n');
 }
@@ -303,10 +357,9 @@ async function downloadDanmaku(lrcUrl, outPath) {
 
 async function processOne(live, opts, fetchDetail) {
   if (opts.json || opts.infoOnly) {
-    // fetch detail only if needed
     let detail = null;
     if (fetchDetail) {
-      try { detail = await getLiveOne(live.liveId); } catch {}
+      try { detail = await getLiveOne(live.liveId, opts); } catch {}
     }
     if (opts.json) {
       const meta = { ...live, _detail: detail };
@@ -317,7 +370,7 @@ async function processOne(live, opts, fetchDetail) {
     return { liveId: live.liveId, status: 'info' };
   }
 
-  const detail = await getLiveOne(live.liveId);
+  const detail = await getLiveOne(live.liveId, opts);
   const m3u8 = detail.playStreamPath;
   const nickname = sanitizeName(live.userInfo?.nickname || detail.user?.userName || opts.member);
   const title = sanitizeName(live.title || detail.title || 'live');
@@ -356,7 +409,6 @@ async function processOne(live, opts, fetchDetail) {
     }
   }
 
-  // Always save metadata JSON
   outMeta = path.join(dir, `${tsTime}.json`);
   await fsp.writeFile(outMeta, JSON.stringify({ ...live, _detail: detail }, null, 2), 'utf8');
   console.log(`META ${live.liveId} -> ${outMeta}`);
@@ -369,22 +421,27 @@ async function main() {
   opts.ffmpeg ||= defaultFfmpeg();
   opts.ffprobe ||= defaultFfprobe();
 
-  // Default --since to 7 days ago if not provided
   if (!opts.since) {
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     opts.since = `${sevenDaysAgo.getFullYear()}-${String(sevenDaysAgo.getMonth() + 1).padStart(2, '0')}-${String(sevenDaysAgo.getDate()).padStart(2, '0')} 00:00:00`;
   }
 
-  // --json implies --info-only unless a --download-* flag is given
   if (opts.json && !opts.downloadDanmaku && opts.downloadVideo === true) {
-    // downloadVideo defaults true; if --json is given alone, treat as info-only
     opts.infoOnly = true;
+  }
+
+  if (opts.proxy) {
+    console.log(`PROXY ${opts.proxy}`);
   }
 
   const sinceMs = parseLocalDate(opts.since);
   const userId = await resolveUserId(opts);
   console.log(`MEMBER ${opts.member} userId=${userId}`);
-  const lives = await fetchLiveList(userId, sinceMs, opts.maxPages, opts.liveType);
+  if (opts.groupId && opts.groupId !== '0') {
+    const label = GROUP_ID_MAP[opts.groupId] || `未知(${opts.groupId})`;
+    console.log(`GROUP ${opts.groupId} (${label})`);
+  }
+  const lives = await fetchLiveList(userId, sinceMs, opts);
   console.log(`SELECTED ${lives.length}`);
 
   if (opts.json || opts.infoOnly) {
