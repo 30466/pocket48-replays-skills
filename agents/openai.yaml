@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pocket48 Live Download"
+  short_description: "Download Pocket48 recorded livestreams by member and time."
+  default_prompt: "Download Pocket48 livestream recordings for a member from a given start time into the configured 48 folder."
