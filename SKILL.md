@@ -84,6 +84,29 @@ node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_poc
   --download-danmaku
 ```
 
+### Download a specific day (e.g. June 19 only)
+
+```bash
+node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_pocket48_lives.mjs \
+  --since '2026-06-19 00:00:00' \
+  --until '2026-06-20 00:00:00'
+```
+
+### Download the latest recording only
+
+```bash
+node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_pocket48_lives.mjs \
+  --since '2026-06-01 00:00:00' \
+  --latest
+```
+
+### Download everything (video + danmaku + cover + metadata)
+
+```bash
+node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_pocket48_lives.mjs \
+  --download-all
+```
+
 ## Options
 
 | Option | Description |
@@ -98,11 +121,14 @@ node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_poc
 | `--info-only` | Show all metadata fields, no download |
 | `--download-video` | Download video/audio stream (default: true) |
 | `--download-danmaku` / `--dl-danmaku` | Download LRC danmaku files |
-| `--download-all` | Download video + danmaku + metadata JSON |
+| `--download-all` | Download video + danmaku + cover + metadata JSON |
+| `--download-cover` | Download cover image (`.jpg`) |
 | `--live-type N` | Filter: 1=直播, 2=电台, 5=游戏, 6=AI (comma-sep) |
+| `--latest` | Only the most recent recording |
 | `--json` | Output metadata as JSON |
 | `--dry-run` | List without downloading |
 | `--max-pages N` | Max API pages, default 20 |
+| `--until 'YYYY-MM-DD HH:mm:ss'` | End time (exclusive), pairs with `--since` for range |
 
 ## Metadata fields shown (--info-only)
 
@@ -144,3 +170,49 @@ The script has a built-in table (`KNOWN_MEMBERS`). To add members, edit the map 
 - `--concurrency 2-3` practical range for parallel downloads
 - `--group-id` overrides the member filter to team-wide scope (useful for browsing)
 - `--proxy` switches API calls to a proxy endpoint (e.g. msg48.org) to bypass rate limits
+
+## 下载前展示 & 实测测速 & 超时保护
+
+在每次下载前，脚本会：
+
+1. **调用 `getLiveOne`** 获取回放详细信息
+2. **解析 M3U8** — 获取精确时长（`#EXTINF` 累加）、精确开始/结束时间（首分片 `startTimestamp` + 推算）和分片总数
+3. **实测下载速度** — 下载第一个 TS 分片，计算 `分片时长 / 实际下载耗时 → 倍速`，并显示 Mbps
+4. **估算下载时间** — 基于实测倍速：`精确时长 / speedFactor`，给出建议超时时长（`预估时间 × 1.5` 安全余量）
+5. **用计算出的超时调用 ffmpeg** — 如果超时则 SIGTERM kill，并检测 `.part` 是否可播放
+6. **下载完后** — 输出实际下载速度（如 `实际速度: 14.2x`）
+
+> **分片开销补偿**：每分片追加 0.1s 的 HTTP 往返预估。2651 个分片≈ +4.4 分钟，使整体估算更贴近实际（单分片测速只反映纯带宽，未计请求/响应/对齐开销）。
+>
+> 如果测速失败（CDN 限制等），回退到保守 8x 估计 + 分片开销。
+
+## 下载后保存的文件
+
+每个录播保存到 `{outRoot}/{member}/{时间戳}/` 目录下：
+
+| 文件 | 说明 |
+|------|------|
+| `*.ts` | 录播视频文件（TS 格式，可直接播放） |
+| `*.json` | 原始 API 元数据（JSON 格式，含 `_preciseDurationSec`, `_startTimestamp`, `_endTimestamp`） |
+| `*.lrc` | 弹幕文件（LRC 格式，`--download-danmaku` 时生成） |
+| `*.jpg` | 封面图片（`--download-cover` 或 `--download-all` 时下载） |
+| `*.info.txt` | **中文标签信息文件**（Human-readable，所有字段含中文说明） |
+
+ `.info.txt` 文件内容示例：
+```
+========================================
+ 口袋48 录播信息
+========================================
+ Live ID:     1275232997965893632
+ 类型:        直播
+ 时间:        2026-06-20 23:20:40
+ 时长(API):   04:19:11
+ 时长(精确):  04:19:04.848
+ 开始时间:    2026-06-20 23:20:41
+ 结束时间:    2026-06-21 03:39:46
+ 标题:        𓆝 𓆟
+ 公告:        1分手写id，3分简评id...
+ 成员:        CGT48-谭思慧
+ 真实姓名:    谭思慧
+ ...
+ ```

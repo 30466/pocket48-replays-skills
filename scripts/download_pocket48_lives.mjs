@@ -14,6 +14,8 @@ const KNOWN_MEMBERS = new Map([
   ['谭思慧', '89653513'],
 ]);
 
+const PER_SEGMENT_OVERHEAD_SEC = 0.1; // 每分片 HTTP 往返开销补偿（秒）
+
 const LIVE_TYPE_LABELS = {
   1: '直播',
   2: '电台',
@@ -62,6 +64,9 @@ Options:
   --live-type N              Filter by type: 1=直播, 2=电台, 5=游戏, 6=AI (comma-sep)
   --json                     Output metadata as JSON
   --dry-run                  List selected recordings without downloading
+  --until 'YYYY-MM-DD HH:mm:ss'  End time (exclusive), pairs with --since for range
+  --latest                   Only download the most recent recording
+  --download-cover           Download cover image
 `);
 }
 
@@ -76,6 +81,8 @@ function parseArgs(argv) {
     infoOnly: false,
     downloadVideo: true,
     downloadDanmaku: false,
+    downloadCover: false,
+    latest: false,
     json: false,
     groupId: '0',
   };
@@ -92,6 +99,11 @@ function parseArgs(argv) {
     } else if (arg === '--download-all') {
       out.downloadVideo = true;
       out.downloadDanmaku = true;
+      out.downloadCover = true;
+    } else if (arg === '--download-cover') {
+      out.downloadCover = true;
+    } else if (arg === '--latest') {
+      out.latest = true;
     } else if (arg === '--json') {
       out.json = true;
     } else if (arg.startsWith('--')) {
@@ -239,7 +251,7 @@ async function resolveUserId(opts) {
   throw new Error(`Cannot resolve member "${opts.member}". Use --user-id to specify the Pocket48 userId directly.`);
 }
 
-async function fetchLiveList(userId, sinceMs, opts) {
+async function fetchLiveList(userId, sinceMs, untilMs, opts) {
   const selected = [];
   let next = '0';
   const base = apiBase(opts);
@@ -253,6 +265,7 @@ async function fetchLiveList(userId, sinceMs, opts) {
     for (const live of lives) {
       const ctime = Number(live.ctime);
       if (ctime >= sinceMs) {
+        if (untilMs && ctime > untilMs) continue;
         if (typeSet && !typeSet.has(live.liveType)) continue;
         selected.push(live);
       }
@@ -273,8 +286,21 @@ async function getLiveOne(liveId, opts) {
 function run(bin, args, opts = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, { stdio: opts.stdio || 'inherit' });
-    child.on('error', reject);
-    child.on('close', code => code === 0 ? resolve() : reject(new Error(`${bin} exited ${code}`)));
+    let timer = null;
+    if (opts.timeout && opts.timeout > 0) {
+      timer = setTimeout(() => {
+        child.kill('SIGTERM');
+        reject(new Error(`Timeout: ${bin} exceeded ${opts.timeout}ms`));
+      }, opts.timeout);
+    }
+    child.on('error', err => {
+      if (timer) clearTimeout(timer);
+      reject(err);
+    });
+    child.on('close', code => {
+      if (timer) clearTimeout(timer);
+      code === 0 ? resolve() : reject(new Error(`${bin} exited ${code}`));
+    });
   });
 }
 
@@ -344,6 +370,134 @@ function formatLiveRecord(live, detail) {
   return lines.join('\n');
 }
 
+async function parseM3U8(m3u8Url) {
+  const res = await fetch(m3u8Url);
+  if (!res.ok) throw new Error(`M3U8 HTTP ${res.status}`);
+  const text = await res.text();
+  let totalDuration = 0;
+  let firstStartTs = null;
+  let segmentCount = 0;
+  let firstSegmentPath = null;
+  for (const line of text.split('\n')) {
+    const extinfMatch = line.match(/^#EXTINF:([\d.]+)/);
+    if (extinfMatch) {
+      totalDuration += parseFloat(extinfMatch[1]);
+      segmentCount++;
+    }
+    if (firstStartTs === null) {
+      const tsMatch = line.match(/(\d{13})-(\d{13})\.ts/);
+      if (tsMatch) firstStartTs = parseInt(tsMatch[1]);
+    }
+    if (!line.startsWith('#') && line.trim().endsWith('.ts')) {
+      if (!firstSegmentPath) firstSegmentPath = line.trim();
+    }
+  }
+  const seg = firstSegmentPath || '';
+  let firstSegmentUrl = null;
+  if (firstSegmentPath) {
+    if (seg.startsWith('http')) {
+      firstSegmentUrl = seg;
+    } else if (seg.startsWith('/')) {
+      const u = new URL(m3u8Url);
+      firstSegmentUrl = u.origin + seg;
+    } else {
+      const baseUrl = m3u8Url.substring(0, m3u8Url.lastIndexOf('/') + 1);
+      firstSegmentUrl = baseUrl + seg;
+    }
+  }
+  return { totalDurationSec: totalDuration, segmentCount, startTimestamp: firstStartTs, firstSegmentUrl };
+}
+
+async function measureDownloadSpeed(firstSegmentUrl, firstSegmentDurationSec) {
+  if (!firstSegmentUrl || !firstSegmentDurationSec || firstSegmentDurationSec <= 0) {
+    return null;
+  }
+  const start = Date.now();
+  const res = await fetch(firstSegmentUrl, {
+    headers: {
+      'User-Agent': 'SNH48 ENGINE',
+      'Accept': '*/*',
+      'Origin': 'https://live.48.cn',
+      'Referer': 'https://live.48.cn/',
+    },
+  });
+  if (!res.ok) throw new Error(`Speed test HTTP ${res.status}`);
+  const buffer = await res.arrayBuffer();
+  const elapsed = (Date.now() - start) / 1000;
+  if (elapsed <= 0) return null;
+  const bytes = buffer.byteLength;
+  const speedBps = bytes / elapsed;
+  const speedMbps = (speedBps * 8) / (1024 * 1024);
+  const speedFactor = firstSegmentDurationSec / elapsed;
+  return { speedFactor, speedMbps, bytes, elapsedMs: Math.round(elapsed * 1000) };
+}
+
+function formatDurationPrecise(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return '(未知)';
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  const intS = Math.floor(s);
+  const ms = Math.round((s - intS) * 1000);
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(intS).padStart(2, '0')}.${String(ms).padStart(3, '0')}`;
+}
+
+function buildInfoText(live, detail, opts, { preciseDurationSec, startTimestamp, endTimestamp } = {}) {
+  const liveType = live.liveType ?? detail?.liveType;
+  const typeLabel = LIVE_TYPE_LABELS[liveType] || `未知(${liveType})`;
+  const ui = live.userInfo;
+  const du = detail?.user;
+  const roles = [];
+  if (ui?.isStar || du?.isStar) roles.push('明星成员');
+  if (ui?.vip || du?.vip) roles.push('VIP');
+  const roleLabel = roles.length ? roles.join(' · ') : (ui?.userRole ? (USER_ROLE_LABELS[ui.userRole] || `角色${ui.userRole}`) : '?');
+  const coverPath = live.coverPath || detail?.coverPath || '';
+  const coverUrl = coverPath ? `https://source.48.cn${coverPath.startsWith('/') ? '' : '/'}${coverPath}` : '(无)';
+  const dims = (live.coverWidth && live.coverHeight) ? `${live.coverWidth}×${live.coverHeight}` : null;
+  const preciseStr = preciseDurationSec ? formatDurationPrecise(preciseDurationSec) : null;
+
+  const lines = [
+    '========================================',
+    ' 口袋48 录播信息',
+    '========================================',
+    ` Live ID:     ${live.liveId}`,
+    ` 类型:        ${typeLabel}`,
+    ` 时间:        ${displayTime(live.ctime)}`,
+    ` 时长(API):   ${live.duration || '(未知)'}`,
+  ];
+  if (preciseStr) {
+    lines.push(` 时长(精确):  ${preciseStr}`);
+  }
+  if (startTimestamp) {
+    lines.push(` 开始时间:    ${displayTime(startTimestamp)}`);
+  }
+  if (endTimestamp) {
+    lines.push(` 结束时间:    ${displayTime(endTimestamp)}`);
+  }
+  lines.push(
+    ` 标题:        ${detail?.title || live.title || '(无标题)'}`,
+    ` 公告:        ${detail?.announcement || live.announcement || '(无)'}`,
+    ` 成员:        ${ui?.nickname || du?.userName || '?'}`,
+    ` 真实姓名:    ${ui?.starName || '?'}`,
+    ` 等级:        ${ui?.level ?? du?.level ?? '?'}`,
+    ` 身份:        ${roleLabel}`,
+    ` 粉丝数:      ${ui?.followers ?? '?'}`,
+    ` 签名:        ${ui?.signature || '(无)'}`,
+    ` 观看人数:    ${live.onlineNum ?? detail?.onlineNum ?? '?'}`,
+    ` 播放次数:    ${live.playNum ?? detail?.playNum ?? '?'}`,
+    ` 封面尺寸:    ${dims || '(未知)'}`,
+    ` liveMode:    ${live.liveMode ?? detail?.liveMode ?? '?'}`,
+    ` 连麦中:      ${live.inMicrophoneConnection ?? detail?.inMicrophoneConnection ?? '?'}`,
+    ` PK连麦:      ${live.inMicrophonePkConnection ?? '?'}`,
+    ` 房间ID:      ${live.roomId ?? detail?.roomId ?? '?'}`,
+    ` M3U8:        ${detail?.playStreamPath || '(无)'}`,
+    ` 弹幕文件:    ${detail?.msgFilePath || '(无)'}`,
+    ` 封面:        ${coverUrl}`,
+    '',
+  );
+  return lines.join('\n');
+}
+
 async function downloadDanmaku(lrcUrl, outPath) {
   console.log(`  DANMAKU ${lrcUrl} -> ${outPath}`);
   const res = await fetch(lrcUrl);
@@ -378,9 +532,77 @@ async function processOne(live, opts, fetchDetail) {
   const dir = path.join(opts.outRoot, opts.member, tsTime);
   await fsp.mkdir(dir, { recursive: true });
 
+  // --- 解析 M3U8 + 实测速度 + 估算超时 ---
+  let preciseDurationSec = null;
+  let startTimestamp = null;
+  let endTimestamp = null;
+  let speedFactor = null;
+  let timeoutMs = null;
+
+  if (m3u8) {
+    try {
+      const parsed = await parseM3U8(m3u8);
+      preciseDurationSec = parsed.totalDurationSec;
+      startTimestamp = parsed.startTimestamp;
+      if (startTimestamp != null && preciseDurationSec > 0) {
+        endTimestamp = startTimestamp + Math.round(preciseDurationSec * 1000);
+      }
+
+      console.log('');
+      console.log('='.repeat(60));
+      console.log(` Live ID:     ${live.liveId}`);
+      console.log(` 类型:        ${LIVE_TYPE_LABELS[live.liveType ?? detail?.liveType] || `未知(${live.liveType ?? detail?.liveType})`}`);
+      console.log(` 时间:        ${displayTime(live.ctime)}`);
+      console.log(` 时长(API):   ${live.duration || '(未知)'}`);
+      console.log(` 时长(精确):  ${formatDurationPrecise(preciseDurationSec)} (${parsed.segmentCount} 个分片)`);
+      if (startTimestamp) {
+        console.log(` 开始时间:    ${displayTime(startTimestamp)}`);
+      }
+      if (endTimestamp) {
+        console.log(` 结束时间:    ${displayTime(endTimestamp)}`);
+      }
+
+      // 实测速度
+      if (parsed.firstSegmentUrl && parsed.segmentCount > 0) {
+        console.log(` 测速中:     ${parsed.firstSegmentUrl}`);
+        const speedInfo = await measureDownloadSpeed(parsed.firstSegmentUrl, preciseDurationSec / parsed.segmentCount);
+        if (speedInfo) {
+          speedFactor = speedInfo.speedFactor;
+          const bwSec = preciseDurationSec / speedFactor;
+          const overheadSec = parsed.segmentCount * PER_SEGMENT_OVERHEAD_SEC;
+          const estimatedSec = bwSec + overheadSec;
+          timeoutMs = Math.ceil(estimatedSec * 1.5 * 1000);
+          console.log(` 下载速度:    ${speedInfo.speedMbps.toFixed(1)} Mbps`);
+          console.log(` 预估倍速:    ${speedFactor.toFixed(1)}x`);
+          console.log(` 分片开销:    ~${Math.ceil(overheadSec / 60)} 分钟 (${parsed.segmentCount}×${PER_SEGMENT_OVERHEAD_SEC}s)`);
+          console.log(` 预估下载:    ~${Math.ceil(estimatedSec / 60)} 分钟`);
+          console.log(` 建议超时:    ${Math.ceil(timeoutMs / 60000)} 分钟 (${timeoutMs}ms)`);
+        }
+      }
+      if (!speedFactor) {
+        speedFactor = 8;
+        const bwSec = preciseDurationSec / speedFactor;
+        const overheadSec = parsed.segmentCount * PER_SEGMENT_OVERHEAD_SEC;
+        const estimatedSec = bwSec + overheadSec;
+        timeoutMs = Math.ceil(estimatedSec * 1.5 * 1000);
+        console.log(` 下载速度:    实测失败，使用保守估计 ${speedFactor}x`);
+        console.log(` 分片开销:    ~${Math.ceil(overheadSec / 60)} 分钟 (${parsed.segmentCount}×${PER_SEGMENT_OVERHEAD_SEC}s)`);
+        console.log(` 预估下载:    ~${Math.ceil(estimatedSec / 60)} 分钟`);
+        console.log(` 建议超时:    ${Math.ceil(timeoutMs / 60000)} 分钟 (${timeoutMs}ms)`);
+      }
+      console.log('='.repeat(60));
+      console.log('');
+    } catch (e) {
+      console.log(`  M3U8 解析失败: ${e.message}`);
+      console.log('');
+    }
+  }
+
   let outVideo = null;
   let outDanmaku = null;
+  let outCover = null;
   let outMeta = null;
+  let downloadStartTime = null;
 
   if (opts.downloadVideo && m3u8) {
     outVideo = path.join(dir, `[口袋48录播]_${nickname}_${title}_${tsTime}_${live.liveId}.ts`);
@@ -389,10 +611,42 @@ async function processOne(live, opts, fetchDetail) {
       console.log(`SKIP VIDEO ${live.liveId} ${outVideo}`);
     } else {
       console.log(`DOWNLOAD VIDEO ${live.liveId} -> ${outVideo}`);
-      await run(opts.ffmpeg, ['-hide_banner', '-nostdin', '-y', '-rw_timeout', '300000000', '-user_agent', 'SNH48 ENGINE', '-i', m3u8, '-c', 'copy', '-f', 'mpegts', part]);
-      await fsp.rename(part, outVideo);
+      downloadStartTime = Date.now();
+      try {
+        await run(opts.ffmpeg, ['-hide_banner', '-nostdin', '-y', '-rw_timeout', '300000000', '-user_agent', 'SNH48 ENGINE', '-i', m3u8, '-c', 'copy', '-f', 'mpegts', part], { timeout: timeoutMs });
+      } catch (e) {
+        // 如果是超时 kill，检查 part 是否可播放（可能已经下载了足够内容）
+        if (e.message?.includes('Timeout')) {
+          console.log(`  TIMEOUT ${live.liveId} (${Math.ceil(timeoutMs / 60000)} 分钟已到)`);
+          if (fs.existsSync(part) && fs.statSync(part).size > 1024 * 1024) {
+            console.log(`  部分文件 ${part} 存在，尝试重命名...`);
+            await fsp.rename(part, outVideo);
+            if (!(await validMedia(outVideo, opts.ffprobe))) {
+              console.log(`  部分文件不可播放，删除`);
+              await fsp.rm(outVideo, { force: true });
+              throw e;
+            }
+            console.log(`  部分文件可播放，保留`);
+          } else {
+            console.log(`  超时文件太小，删除`);
+            await fsp.rm(part, { force: true });
+            throw e;
+          }
+        } else {
+          throw e;
+        }
+      }
+      if (fs.existsSync(part)) {
+        await fsp.rename(part, outVideo);
+      }
       if (!(await validMedia(outVideo, opts.ffprobe))) throw new Error(`ffprobe validation failed: ${outVideo}`);
-      console.log(`DONE VIDEO ${live.liveId}`);
+      const downloadElapsed = (Date.now() - downloadStartTime) / 1000;
+      if (preciseDurationSec && preciseDurationSec > 0 && downloadElapsed > 0) {
+        const actualSpeed = preciseDurationSec / downloadElapsed;
+        console.log(`DONE VIDEO ${live.liveId} (实际速度: ${actualSpeed.toFixed(1)}x)`);
+      } else {
+        console.log(`DONE VIDEO ${live.liveId}`);
+      }
     }
   }
 
@@ -409,9 +663,39 @@ async function processOne(live, opts, fetchDetail) {
     }
   }
 
+  if (opts.downloadCover) {
+    const coverPath = detail.coverPath || live.coverPath;
+    if (coverPath) {
+      const coverUrl = `https://source.48.cn${coverPath.startsWith('/') ? '' : '/'}${coverPath}`;
+      outCover = path.join(dir, `${tsTime}.jpg`);
+      if (fs.existsSync(outCover)) {
+        console.log(`SKIP COVER ${live.liveId} ${outCover}`);
+      } else {
+        console.log(`DOWNLOAD COVER ${coverUrl} -> ${outCover}`);
+        try {
+          const res = await fetch(coverUrl, {
+            headers: { 'User-Agent': USER_AGENT, 'Referer': 'https://live.48.cn/' },
+          });
+          if (!res.ok) throw new Error(`Cover HTTP ${res.status}`);
+          const buf = await res.arrayBuffer();
+          await fsp.writeFile(outCover, Buffer.from(buf));
+          console.log(`DONE COVER ${live.liveId}`);
+        } catch (e) {
+          console.error(`  COVER FAILED: ${e.message}`);
+        }
+      }
+    }
+  }
+
+  // 保存 JSON 元数据
   outMeta = path.join(dir, `${tsTime}.json`);
-  await fsp.writeFile(outMeta, JSON.stringify({ ...live, _detail: detail }, null, 2), 'utf8');
+  await fsp.writeFile(outMeta, JSON.stringify({ ...live, _detail: detail, _preciseDurationSec: preciseDurationSec, _startTimestamp: startTimestamp, _endTimestamp: endTimestamp }, null, 2), 'utf8');
   console.log(`META ${live.liveId} -> ${outMeta}`);
+
+  // 保存中文标签信息文件
+  const infoTxt = path.join(dir, `${tsTime}.info.txt`);
+  await fsp.writeFile(infoTxt, buildInfoText(live, detail, opts, { preciseDurationSec, startTimestamp, endTimestamp }), 'utf8');
+  console.log(`INFO ${live.liveId} -> ${infoTxt}`);
 
   return { liveId: live.liveId, status: 'done', outVideo, outDanmaku, outMeta };
 }
@@ -435,13 +719,21 @@ async function main() {
   }
 
   const sinceMs = parseLocalDate(opts.since);
+  let untilMs;
+  if (opts.until) {
+    untilMs = parseLocalDate(opts.until);
+    console.log(`UNTIL ${displayTime(untilMs)}`);
+  }
   const userId = await resolveUserId(opts);
   console.log(`MEMBER ${opts.member} userId=${userId}`);
   if (opts.groupId && opts.groupId !== '0') {
     const label = GROUP_ID_MAP[opts.groupId] || `未知(${opts.groupId})`;
     console.log(`GROUP ${opts.groupId} (${label})`);
   }
-  const lives = await fetchLiveList(userId, sinceMs, opts);
+  let lives = await fetchLiveList(userId, sinceMs, untilMs, opts);
+  if (opts.latest && lives.length > 0) {
+    lives = [lives[lives.length - 1]];
+  }
   console.log(`SELECTED ${lives.length}`);
 
   if (opts.json || opts.infoOnly) {
@@ -451,14 +743,18 @@ async function main() {
       await processOne(live, opts, true);
     }
     if (opts.json) return;
-  } else {
+  }
+
+  if (opts.dryRun) {
+    // dry-run: 打印精简信息
     for (const live of lives) {
       const typeLabel = LIVE_TYPE_LABELS[live.liveType] || `未知(${live.liveType})`;
       console.log(`${displayTime(live.ctime)} ${live.liveId} [${typeLabel}] ${live.title || ''}`);
     }
+    return;
   }
 
-  if (opts.dryRun || opts.infoOnly) return;
+  if (opts.infoOnly) return;
 
   console.log(`CONCURRENCY ${opts.concurrency}`);
   const results = await mapLimit(lives, opts.concurrency, live => processOne(live, opts, false));
