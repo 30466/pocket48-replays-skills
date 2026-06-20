@@ -106,6 +106,7 @@ node /Users/cbj/Documents/48/_codex_skills/pocket48-replays/scripts/download_poc
 ## Metadata fields shown (--info-only)
 
 - Live ID, Type (直播/电台/游戏/AI), Title
+- Announcement (公告/计分规则说明)
 - Member name, avatar, team
 - Start time, end time, creation time
 - Watch count (onlineNum), play count (playNum)
