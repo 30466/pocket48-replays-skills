@@ -2,17 +2,13 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 
 const OFFICIAL_API = 'https://pocketapi.48.cn/live/api/v1/live';
-const MSG48_API = 'https://msg48.org/api/live';
 const DEFAULT_OUT_ROOT = '/Users/cbj/Documents/48';
-const DEFAULT_MEMBER_SOURCE = '/private/tmp/roomId.json';
+const DEFAULT_MEMBER_SOURCE = 'https://abm48.com/api/public/snh48/room-map';
 const USER_AGENT = 'PocketFans201807/6.0.16 (iPhone; iOS 13.5.1; Scale/2.00)';
-
-const KNOWN_MEMBERS = new Map([
-  ['谭思慧', '89653513'],
-]);
 
 const PER_SEGMENT_OVERHEAD_SEC = 0.1; // 每分片 HTTP 往返开销补偿（秒）
 
@@ -50,12 +46,11 @@ Options:
   --since 'YYYY-MM-DD HH:mm:ss'  Start time, default 7 days ago
   --user-id ID               Pocket48 userId; skips member-source lookup
   --group-id N               Filter by team (10=SNH48, 21=CGT48, etc.)
-  --proxy URL                Use API proxy (e.g. https://msg48.org/api/live)
   --out-root DIR             Output root, default ${DEFAULT_OUT_ROOT}
-  --member-source FILE       roomId.json source, default ${DEFAULT_MEMBER_SOURCE}
+  --member-source URL|FILE   Member map source (URL or local JSON), default ${DEFAULT_MEMBER_SOURCE}
   --ffmpeg PATH              ffmpeg binary, default auto-detect
   --ffprobe PATH             ffprobe binary, default auto-detect
-  --max-pages N              Max getLiveList pages, default 20
+  --max-pages N              Max getLiveList pages, default 200
   --concurrency N            Parallel ffmpeg downloads, default 1; recommend 2-3
   --info-only                Show all metadata for selected recordings, no download
   --download-video           Download video/audio stream (default: true)
@@ -75,7 +70,7 @@ function parseArgs(argv) {
     member: '谭思慧',
     outRoot: DEFAULT_OUT_ROOT,
     memberSource: DEFAULT_MEMBER_SOURCE,
-    maxPages: 20,
+    maxPages: 200,
     concurrency: 1,
     dryRun: false,
     infoOnly: false,
@@ -115,7 +110,7 @@ function parseArgs(argv) {
       throw new Error(`Unknown argument: ${arg}`);
     }
   }
-  out.maxPages = Number(out.maxPages || 20);
+  out.maxPages = Number(out.maxPages || 200);
   out.concurrency = Math.max(1, Number(out.concurrency || 1));
   if (!Number.isInteger(out.concurrency)) throw new Error('--concurrency must be an integer');
   return out;
@@ -156,10 +151,6 @@ function defaultFfprobe() {
   return 'ffprobe';
 }
 
-function apiBase(opts) {
-  return opts.proxy || OFFICIAL_API;
-}
-
 function pocketHeaders() {
   return {
     'Content-Type': 'application/json;charset=utf-8',
@@ -168,7 +159,7 @@ function pocketHeaders() {
     'Host': 'pocketapi.48.cn',
     'appInfo': JSON.stringify({
       vendor: 'apple',
-      deviceId: 'ABCDEFGH-ABCD-ABCD-ABCD-ABCDEFGHIJKL',
+      deviceId: crypto.randomUUID(),
       appVersion: '7.0.4',
       appBuild: '23011601',
       osVersion: '16.3.1',
@@ -179,26 +170,21 @@ function pocketHeaders() {
   };
 }
 
-function proxyHeaders() {
-  return { 'Content-Type': 'application/json;charset=utf-8' };
-}
-
-async function postJson(url, body, useProxy) {
-  const headers = useProxy ? proxyHeaders() : pocketHeaders();
-  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
-  if (!res.ok) throw new Error(`${url} HTTP ${res.status}`);
+async function postJson(endpoint, body) {
+  const url = `${OFFICIAL_API}${endpoint}`;
+  const res = await fetch(url, { method: 'POST', headers: pocketHeaders(), body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`Pocket48 API blocked (HTTP ${res.status}). Switch to a mainland China IP - HK/TW/overseas won't work`);
   const json = await res.json();
-  if (!json.success) throw new Error(`${url} API error: ${json.message || JSON.stringify(json)}`);
+  if (!json.success) throw new Error(`Pocket48 API error: ${json.message || JSON.stringify(json)}`);
   return json.content;
 }
 
-async function searchMemberViaApi(member, opts, maxPages = 5) {
-  const base = apiBase(opts);
+async function searchMemberViaApi(member, opts, maxPages = 200) {
   let next = '0';
   for (let page = 1; page <= maxPages; page++) {
     let content;
     try {
-      content = await postJson(`${base}/getLiveList`, { userId: '0', next }, !!opts.proxy);
+      content = await postJson('/getLiveList', { userId: '0', next, debug: true, record: true });
     } catch (e) {
       console.error(`API search page ${page} failed: ${e.message}`);
       return null;
@@ -220,26 +206,52 @@ async function searchMemberViaApi(member, opts, maxPages = 5) {
 async function resolveUserId(opts) {
   if (opts.userId) return String(opts.userId);
 
-  const knownId = KNOWN_MEMBERS.get(opts.member);
-  if (knownId) {
-    console.log(`LOOKUP ${opts.member} -> userId=${knownId} (built-in table)`);
-    return knownId;
+  // --- 加载成员映射表（URL 或本地文件）---
+  let mapData = {};
+
+  if (/^https?:\/\//.test(opts.memberSource)) {
+    const res = await fetch(opts.memberSource);
+    if (!res.ok) throw new Error(`Member source HTTP ${res.status}`);
+    mapData = await res.json();
+  } else {
+    try {
+      const raw = await fsp.readFile(opts.memberSource, 'utf8');
+      mapData = JSON.parse(raw);
+    } catch (e) {
+      console.log(`Cannot read local member source (${opts.memberSource}), falling back to API...`);
+    }
   }
 
-  try {
-    const raw = await fsp.readFile(opts.memberSource, 'utf8');
-    const data = JSON.parse(raw);
-    const list = Array.isArray(data) ? data : data.roomId;
-    if (Array.isArray(list)) {
-      const exact = list.find(x => [x.ownerName, x.starName, x.nickname, x.userName].filter(Boolean).includes(opts.member));
-      const hit = exact || list.find(x => [x.ownerName, x.starName, x.nickname, x.userName, x.pinyin].filter(Boolean).some(v => String(v).includes(opts.member)));
-      if (hit) {
-        const id = String(hit.userId || hit.id);
-        console.log(`LOOKUP ${opts.member} -> userId=${id} (${opts.memberSource})`);
-        return id;
+  // --- 归一化为 {name: pocket_id} 字典 ---
+  const lookup = {};
+  if (mapData && typeof mapData === 'object') {
+    if (Array.isArray(mapData)) {
+      for (const item of mapData) {
+        const name = item.ownerName || item.starName || item.nickname || item.userName;
+        if (name) lookup[name] = String(item.userId || item.id);
       }
+    } else if (mapData.roomId && Array.isArray(mapData.roomId)) {
+      for (const item of mapData.roomId) {
+        const name = item.ownerName || item.starName || item.nickname || item.userName;
+        if (name) lookup[name] = String(item.userId || item.id);
+      }
+    } else {
+      Object.assign(lookup, Object.fromEntries(Object.entries(mapData).map(([k, v]) => [k, String(v)])));
     }
-  } catch {}
+  }
+
+  // 精确匹配
+  if (lookup[opts.member]) {
+    console.log(`LOOKUP ${opts.member} -> userId=${lookup[opts.member]} (member map)`);
+    return lookup[opts.member];
+  }
+
+  // 模糊匹配
+  const fuzzy = Object.keys(lookup).find(k => k.includes(opts.member));
+  if (fuzzy) {
+    console.log(`LOOKUP ${opts.member} -> userId=${lookup[fuzzy]} (fuzzy: ${fuzzy})`);
+    return lookup[fuzzy];
+  }
 
   console.log(`SEARCH ${opts.member} via API...`);
   const apiId = await searchMemberViaApi(opts.member, opts);
@@ -254,12 +266,11 @@ async function resolveUserId(opts) {
 async function fetchLiveList(userId, sinceMs, untilMs, opts) {
   const selected = [];
   let next = '0';
-  const base = apiBase(opts);
   const typeSet = opts.liveType ? new Set(opts.liveType.split(',').map(Number)) : null;
   for (let page = 1; page <= opts.maxPages; page++) {
-    const body = { userId, next };
+    const body = { userId, next, debug: true, record: true };
     if (opts.groupId !== '0') body.groupId = Number(opts.groupId);
-    const content = await postJson(`${base}/getLiveList`, body, !!opts.proxy);
+    const content = await postJson('/getLiveList', body);
     const lives = content.liveList || [];
     if (!lives.length) break;
     for (const live of lives) {
@@ -279,8 +290,7 @@ async function fetchLiveList(userId, sinceMs, untilMs, opts) {
 }
 
 async function getLiveOne(liveId, opts) {
-  const base = apiBase(opts);
-  return postJson(`${base}/getLiveOne`, { liveId: String(liveId) }, !!opts.proxy);
+  return postJson('/getLiveOne', { liveId: String(liveId) });
 }
 
 function run(bin, args, opts = {}) {
@@ -712,10 +722,6 @@ async function main() {
 
   if (opts.json && !opts.downloadDanmaku && opts.downloadVideo === true) {
     opts.infoOnly = true;
-  }
-
-  if (opts.proxy) {
-    console.log(`PROXY ${opts.proxy}`);
   }
 
   const sinceMs = parseLocalDate(opts.since);
