@@ -54,6 +54,7 @@ Options:
   --concurrency N            Parallel ffmpeg downloads, default 1; recommend 2-3
   --info-only                Show all metadata for selected recordings, no download
   --download-video           Download video/audio stream (default: true)
+  --no-video                 Skip video download, use with --download-danmaku/cover
   --download-danmaku         Download LRC danmaku files
   --download-all             Download video + danmaku + metadata JSON
   --live-type N              Filter by type: 1=直播, 2=电台, 5=游戏, 6=AI (comma-sep)
@@ -89,6 +90,8 @@ function parseArgs(argv) {
       out.infoOnly = true;
     } else if (arg === '--download-video') {
       out.downloadVideo = true;
+    } else if (arg === '--no-video' || arg === '--skip-video') {
+      out.downloadVideo = false;
     } else if (arg === '--download-danmaku' || arg === '--dl-danmaku') {
       out.downloadDanmaku = true;
     } else if (arg === '--download-all') {

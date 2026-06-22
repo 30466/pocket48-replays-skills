@@ -120,6 +120,7 @@ node /Users/cbj/Documents/48/skills/pocket48-replays/scripts/download_pocket48_l
 | `--concurrency N` | Parallel downloads, default 1 |
 | `--info-only` | Show all metadata fields, no download |
 | `--download-video` | Download video/audio stream (default: true) |
+| `--no-video` / `--skip-video` | Skip video download; combine with `--download-danmaku` and/or `--download-cover` |
 | `--download-danmaku` / `--dl-danmaku` | Download LRC danmaku files |
 | `--download-all` | Download video + danmaku + cover + metadata JSON |
 | `--download-cover` | Download cover image (`.jpg`) |
