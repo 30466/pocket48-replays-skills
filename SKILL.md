@@ -26,6 +26,50 @@ Output root is `/Users/cbj/Documents/48`.
 - **ffmpeg + ffprobe** (for video download; auto-detected at `/opt/homebrew/bin/`)
 - **Network:** Only **mainland China IPs** can access Pocket48 API directly. Hong Kong, Macau, Taiwan, and overseas IPs will be blocked (HTTP 403). Switch to a mainland China IP if blocked.
 
+## Workflow
+
+### Step 0.5: 检查环境
+
+先确认系统环境是否满足运行条件：
+
+**1. Node.js**
+
+```bash
+node --version
+```
+
+| 结果 | 操作 |
+|------|------|
+| 输出版本号如 `v18.0.0` | ✅ 继续 |
+| `command not found: node` | ❌ 引导安装 |
+
+安装指引：
+- **macOS**: `brew install node`
+- **Linux**: `apt install nodejs` 或 `dnf install nodejs`
+- **Windows**: 从 https://nodejs.org 下载 LTS 版本安装
+
+**2. ffmpeg + ffprobe**
+
+```bash
+ffmpeg -version && ffprobe -version
+```
+
+| 结果 | 操作 |
+|------|------|
+| 输出版本号 | ✅ 继续 |
+| `command not found` | ❌ 引导安装 |
+
+安装指引：
+- **macOS**: `brew install ffmpeg`
+- **Linux**: `sudo apt install ffmpeg` 或 `sudo dnf install ffmpeg`
+- **Windows**: 从 https://ffmpeg.org/download.html 下载 → 解压 → 将 `bin` 目录加入系统 PATH → 重启终端
+
+**3. 网络环境**
+
+Pocket48 API 仅限**中国大陆 IP** 访问。如果执行时遇到 HTTP 403，需切换网络环境（代理关闭 / 使用国内服务器）。
+
+两个环境都确认正常后进入下一步。
+
 ## Usage
 
 ### Query with full metadata (no download)
