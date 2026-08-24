@@ -5,7 +5,18 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 
-const OFFICIAL_API = 'https://pocketapi.48.cn/live/api/v1/live';
+const API_ENDPOINTS = [
+  {
+    name: 'official',
+    baseUrl: 'https://pocketapi.48.cn/live/api/v1/live',
+    officialHost: true,
+  },
+  {
+    name: 'tools.abm48.com',
+    baseUrl: 'https://tools.abm48.com/pocketapi',
+    officialHost: false,
+  },
+];
 const DEFAULT_OUT_ROOT = '/Users/cbj/Documents/48';
 const DEFAULT_MEMBER_SOURCE = 'https://abm48.com/api/public/snh48/room-map';
 const USER_AGENT = 'PocketFans201807/6.0.16 (iPhone; iOS 13.5.1; Scale/2.00)';
@@ -154,12 +165,13 @@ function defaultFfprobe() {
   return 'ffprobe';
 }
 
-function pocketHeaders() {
-  return {
+function pocketHeaders(officialHost = false) {
+  const headers = {
     'Content-Type': 'application/json;charset=utf-8',
     'User-Agent': USER_AGENT,
     'Accept-Language': 'zh-Hans-AW;q=1',
-    'Host': 'pocketapi.48.cn',
+    'Origin': 'https://h5.48.cn',
+    'Referer': 'https://h5.48.cn/',
     'appInfo': JSON.stringify({
       vendor: 'apple',
       deviceId: crypto.randomUUID(),
@@ -171,15 +183,53 @@ function pocketHeaders() {
       os: 'ios'
     })
   };
+  if (officialHost) headers.Host = 'pocketapi.48.cn';
+  return headers;
+}
+
+let activeApiEndpointIndex = 0;
+
+function conciseApiError(error) {
+  if (error?.name === 'AbortError' || error?.name === 'TimeoutError') return 'request timed out';
+  return String(error?.message || error).replace(/\s+/g, ' ').slice(0, 180);
 }
 
 async function postJson(endpoint, body) {
-  const url = `${OFFICIAL_API}${endpoint}`;
-  const res = await fetch(url, { method: 'POST', headers: pocketHeaders(), body: JSON.stringify(body) });
-  if (!res.ok) throw new Error(`Pocket48 API blocked (HTTP ${res.status}). Switch to a mainland China IP - HK/TW/overseas won't work`);
-  const json = await res.json();
-  if (!json.success) throw new Error(`Pocket48 API error: ${json.message || JSON.stringify(json)}`);
-  return json.content;
+  const candidateIndexes = [
+    activeApiEndpointIndex,
+    ...API_ENDPOINTS.map((_, index) => index).filter(index => index !== activeApiEndpointIndex),
+  ];
+  const failures = [];
+
+  for (const index of candidateIndexes) {
+    const candidate = API_ENDPOINTS[index];
+    const url = `${candidate.baseUrl}${endpoint}`;
+    try {
+      const fetchOptions = {
+        method: 'POST',
+        headers: pocketHeaders(candidate.officialHost),
+        body: JSON.stringify(body),
+      };
+      if (typeof AbortSignal?.timeout === 'function') {
+        fetchOptions.signal = AbortSignal.timeout(20_000);
+      }
+      const res = await fetch(url, fetchOptions);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const json = await res.json();
+      if (!json.success) throw new Error(json.message || `status ${json.status || 'unknown'}`);
+
+      if (index !== activeApiEndpointIndex) {
+        console.error(`Pocket48 API fallback: ${candidate.name}`);
+        activeApiEndpointIndex = index;
+      }
+      return json.content;
+    } catch (error) {
+      failures.push(`${candidate.name}: ${conciseApiError(error)}`);
+    }
+  }
+
+  throw new Error(`Pocket48 API unavailable after trying all endpoints (${failures.join('; ')})`);
 }
 
 async function searchMemberViaApi(member, opts, maxPages = 200) {

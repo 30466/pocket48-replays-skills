@@ -24,7 +24,7 @@ Output root is `/Users/cbj/Documents/48`.
 
 - **Node.js 18+** (for native `fetch` support)
 - **ffmpeg + ffprobe** (for video download; auto-detected at `/opt/homebrew/bin/`)
-- **Network:** Only **mainland China IPs** can access Pocket48 API directly. Hong Kong, Macau, Taiwan, and overseas IPs will be blocked (HTTP 403). Switch to a mainland China IP if blocked.
+- **Network:** The official Pocket48 API requires Pocket48-compatible request headers, including `Referer: https://h5.48.cn/`; missing this header may return HTTP 403 even when the network itself is allowed. The script sends the required headers and falls back to the public `tools.abm48.com` API relay only when the official endpoint is genuinely unavailable. Media, cover, and danmaku files continue to download directly from their CDN URLs.
 
 ## Workflow
 
@@ -66,7 +66,7 @@ ffmpeg -version && ffprobe -version
 
 **3. 网络环境**
 
-Pocket48 API 仅限**中国大陆 IP** 访问。如果执行时遇到 HTTP 403，需切换网络环境（代理关闭 / 使用国内服务器）。
+脚本会带上 Pocket48 网页端所需的 `Origin` 和 `Referer` 请求头，先直连 Pocket48 官方 API。若官方端点确实不可用，才会回退到 `tools.abm48.com/pocketapi`。两个入口都失败时才需要检查网络或代理配置。
 
 两个环境都确认正常后进入下一步。
 
@@ -184,7 +184,7 @@ The script resolves member names to Pocket48 userIds automatically in this order
 3. **Fallback: brute-force API search** — paginates through all recordings (userId=0) looking for matching nickname
 4. **Error** — if all fail, prompts you to use `--user-id`
 
-> **Note:** Step 1 (abm48.com) works globally. Step 2 (Pocket48 live API) requires a mainland China IP.
+> **Note:** Step 1 (abm48.com) works globally. Step 2 automatically uses the same official API → `tools.abm48.com/pocketapi` fallback as normal recording queries.
 
 ## Metadata fields shown (--info-only)
 
@@ -223,6 +223,8 @@ The script resolves member names to Pocket48 userIds automatically in this order
 - `--group-id` overrides the member filter to team-wide scope (useful for browsing)
 - `--member-source` accepts a URL or local JSON file; compatible with both `{name: id}` flat dict and `roomId.json` array format
 - Each request uses a random `deviceId` to avoid triggering rate limits
+- Official API requests include the Pocket48 H5 `Origin` and `Referer`; omitting the `Referer` can cause HTTP 403
+- API requests remember the first working endpoint for the rest of the run, so an unavailable official endpoint is not retried for every page or recording detail
 
 ## 下载前展示 & 实测测速 & 超时保护
 
