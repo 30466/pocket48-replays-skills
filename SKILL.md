@@ -1,6 +1,6 @@
 ---
 name: pocket48-replays
-description: Query, inspect, and download Pocket48/口袋48 live & radio recordings, danmaku, and metadata for 48-group members. Defaults to 谭思慧. Supports --dry-run to preview, --info-only for full metadata, --download-danmaku for LRC danmaku files, --live-type filter, and --group-id team filter.
+description: Query, inspect, and download Pocket48/口袋48 live & radio recordings, danmaku, and metadata for 48-group members. Defaults to 谭思慧. Supports detached background jobs with compact or disabled logs, --dry-run previews, full metadata, LRC danmaku, live-type filters, and team filters.
 ---
 
 # Pocket48 Replays
@@ -174,6 +174,11 @@ node /Users/cbj/Documents/48/skills/pocket48-replays/scripts/download_pocket48_l
 | `--dry-run` | List without downloading |
 | `--max-pages N` | Max API pages, default 200 |
 | `--until 'YYYY-MM-DD HH:mm:ss'` | End time (exclusive), pairs with `--since` for range |
+| `--background` | Start a detached job and return immediately; recommended for video/audio downloads |
+| `--log-file FILE` | Background log path; default is the job directory |
+| `--no-log` | Discard background stdout/stderr while still saving status JSON |
+| `--verbose-ffmpeg` | Include ffmpeg's detailed progress; default logs are compact |
+| `--timeout-minutes N` | Optional hard download limit; there is no artificial timeout by default |
 
 ## Member name → userId lookup
 
@@ -216,7 +221,8 @@ The script resolves member names to Pocket48 userIds automatically in this order
 - `--since` is inclusive
 - The script queries `getLiveList`, then `getLiveOne` for details
 - Existing valid `.ts` files are skipped via ffprobe validation
-- Incomplete `.part` downloads are overwritten on re-run
+- Existing and newly downloaded `.ts` files are checked against the precise M3U8 duration; merely being playable is not enough
+- Incomplete `.part` downloads stay marked as partial and are overwritten on re-run
 - Metadata JSON is always saved alongside downloads
 - Danmaku files are in standard LRC format, one line per danmaku
 - `--concurrency 2-3` practical range for parallel downloads
@@ -226,20 +232,60 @@ The script resolves member names to Pocket48 userIds automatically in this order
 - Official API requests include the Pocket48 H5 `Origin` and `Referer`; omitting the `Referer` can cause HTTP 403
 - API requests remember the first working endpoint for the rest of the run, so an unavailable official endpoint is not retried for every page or recording detail
 
-## 下载前展示 & 实测测速 & 超时保护
+## 长下载的执行规则（避免工具超时和上下文膨胀）
+
+实际下载视频或音频时，默认加 `--background`。脚本会启动一个与当前终端分离的子进程，所以调用它的 AI 工具超时、结束等待或用户继续发消息，不会顺带杀掉下载进程。
+
+```bash
+node /Users/cbj/Documents/48/skills/pocket48-replays/scripts/download_pocket48_lives.mjs \
+  --latest \
+  --download-all \
+  --background
+```
+
+启动命令会立即返回三行简短信息：
+
+```text
+BACKGROUND_STARTED pid=12345
+STATUS /Users/cbj/Documents/48/.pocket48-replays/jobs/<job-id>.json
+LOG /Users/cbj/Documents/48/.pocket48-replays/jobs/<job-id>.log
+```
+
+- 状态 JSON 很小，包含 `starting`、`running`、`done` 或 `failed`、PID、开始/结束时间及错误摘要。
+- 默认把**精简日志**写到文件，不要把完整日志读入对话。需要检查时只读取状态 JSON；失败或结束后最多 `tail -n 30` 日志。
+- 完全不需要日志时加 `--no-log`。即使没有日志，状态 JSON 仍会更新。
+- 需要指定日志位置时用 `--log-file FILE`。
+- 只有用户明确要求逐帧进度时才加 `--verbose-ffmpeg`；否则 ffmpeg 的高频进度行会被抑制。
+- `--dry-run`、`--info-only` 这类短任务直接前台运行即可。
+- 如果用户要求一直等到完成，轮询状态 JSON（建议 30–60 秒一次），不要持续流式读取日志，也不要让一次工具调用挂住整个下载时长。
+
+### 超时策略
+
+默认**不设人工总时限**。ffmpeg 仍通过 `-rw_timeout` 处理长时间无网络数据的连接，但脚本不再根据单个分片的瞬时速度计算时限并主动杀进程。测速结果只用于展示参考下载时间。
+
+只有用户明确希望设置硬上限时才传：
+
+```bash
+--timeout-minutes 120
+```
+
+触发硬上限或 ffmpeg 出错时，`.part` 文件不会被改名成正式 `.ts`。任务会标记为失败，避免把截断但可播放的文件误报为成功。
+
+## 下载前展示、测速与完整性保护
 
 在每次下载前，脚本会：
 
 1. **调用 `getLiveOne`** 获取回放详细信息
 2. **解析 M3U8** — 获取精确时长（`#EXTINF` 累加）、精确开始/结束时间（首分片 `startTimestamp` + 推算）和分片总数
 3. **实测下载速度** — 下载第一个 TS 分片，计算 `分片时长 / 实际下载耗时 → 倍速`，并显示 Mbps
-4. **估算下载时间** — 基于实测倍速：`精确时长 / speedFactor`，给出建议超时时长（`预估时间 × 1.5` 安全余量）
-5. **用计算出的超时调用 ffmpeg** — 如果超时则 SIGTERM kill，并检测 `.part` 是否可播放
-6. **下载完后** — 输出实际下载速度（如 `实际速度: 14.2x`）
+4. **估算下载时间** — 基于实测倍速给出参考值，但不以此控制进程寿命
+5. **调用 ffmpeg** — 默认自然下载完成；仅在显式设置 `--timeout-minutes` 时执行总时限
+6. **下载后校验完整时长** — 使用 ffprobe 比较文件实际时长与 M3U8 精确时长，通过后才把 `.part` 改为正式 `.ts`
+7. **下载完后** — 输出实际下载速度（如 `实际速度: 14.2x`）
 
 > **分片开销补偿**：每分片追加 0.1s 的 HTTP 往返预估。2651 个分片≈ +4.4 分钟，使整体估算更贴近实际（单分片测速只反映纯带宽，未计请求/响应/对齐开销）。
 >
-> 如果测速失败（CDN 限制等），回退到保守 8x 估计 + 分片开销。
+> 如果测速失败（CDN 限制等），回退到保守 8x 估计 + 分片开销。该估计仅供展示，不会触发自动终止。
 
 ## 下载后保存的文件
 

@@ -4,6 +4,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const API_ENDPOINTS = [
   {
@@ -74,6 +75,12 @@ Options:
   --until 'YYYY-MM-DD HH:mm:ss'  End time (exclusive), pairs with --since for range
   --latest                   Only download the most recent recording
   --download-cover           Download cover image
+  --background               Start a detached download job and return immediately
+  --log-file FILE            Background log path (default: job directory)
+  --no-log                   Discard background stdout/stderr; status JSON is still saved
+  --verbose-ffmpeg           Include ffmpeg progress output (default: compact errors/warnings)
+  --timeout-minutes N        Optional total ffmpeg limit; default: no artificial limit
+  --help                     Show this help
 `);
 }
 
@@ -92,6 +99,10 @@ function parseArgs(argv) {
     latest: false,
     json: false,
     groupId: '0',
+    background: false,
+    noLog: false,
+    verboseFfmpeg: false,
+    help: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -115,6 +126,14 @@ function parseArgs(argv) {
       out.latest = true;
     } else if (arg === '--json') {
       out.json = true;
+    } else if (arg === '--background') {
+      out.background = true;
+    } else if (arg === '--no-log') {
+      out.noLog = true;
+    } else if (arg === '--verbose-ffmpeg') {
+      out.verboseFfmpeg = true;
+    } else if (arg === '--help' || arg === '-h') {
+      out.help = true;
     } else if (arg.startsWith('--')) {
       const key = arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
       const val = argv[++i];
@@ -127,7 +146,80 @@ function parseArgs(argv) {
   out.maxPages = Number(out.maxPages || 200);
   out.concurrency = Math.max(1, Number(out.concurrency || 1));
   if (!Number.isInteger(out.concurrency)) throw new Error('--concurrency must be an integer');
+  if (out.timeoutMinutes != null) {
+    out.timeoutMinutes = Number(out.timeoutMinutes);
+    if (!Number.isFinite(out.timeoutMinutes) || out.timeoutMinutes <= 0) {
+      throw new Error('--timeout-minutes must be a positive number');
+    }
+  }
   return out;
+}
+
+function backgroundChildArgs(argv) {
+  const result = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--background' || arg === '--no-log') continue;
+    if (arg === '--log-file') {
+      i += 1;
+      continue;
+    }
+    result.push(arg);
+  }
+  return result;
+}
+
+async function mergeJsonFile(file, patch) {
+  let current = {};
+  try {
+    current = JSON.parse(await fsp.readFile(file, 'utf8'));
+  } catch {}
+  await fsp.writeFile(file, JSON.stringify({ ...current, ...patch }, null, 2), 'utf8');
+}
+
+async function launchBackground(argv, opts) {
+  const jobsDir = path.join(path.resolve(opts.outRoot), '.pocket48-replays', 'jobs');
+  await fsp.mkdir(jobsDir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const jobId = `${stamp}-${crypto.randomBytes(3).toString('hex')}`;
+  const startedAt = new Date().toISOString();
+  const statusFile = path.join(jobsDir, `${jobId}.json`);
+  const logFile = opts.noLog ? null : path.resolve(opts.logFile || path.join(jobsDir, `${jobId}.log`));
+  if (logFile) await fsp.mkdir(path.dirname(logFile), { recursive: true });
+
+  await mergeJsonFile(statusFile, {
+    jobId,
+    state: 'starting',
+    pid: null,
+    startedAt,
+    finishedAt: null,
+    logFile,
+    statusFile,
+    args: backgroundChildArgs(argv),
+  });
+
+  let logFd = null;
+  try {
+    if (logFile) logFd = fs.openSync(logFile, 'a');
+    const child = spawn(process.execPath, [path.resolve(process.argv[1]), ...backgroundChildArgs(argv)], {
+      detached: true,
+      stdio: ['ignore', logFile ? logFd : 'ignore', logFile ? logFd : 'ignore'],
+      env: {
+        ...process.env,
+        POCKET48_JOB_STATUS_FILE: statusFile,
+        POCKET48_JOB_STARTED_AT: startedAt,
+      },
+    });
+    child.unref();
+    // Only patch the PID here. The child owns state transitions, preventing a
+    // very fast child from being changed from done/failed back to running.
+    await mergeJsonFile(statusFile, { pid: child.pid });
+    console.log(`BACKGROUND_STARTED pid=${child.pid}`);
+    console.log(`STATUS ${statusFile}`);
+    console.log(logFile ? `LOG ${logFile}` : 'LOG disabled');
+  } finally {
+    if (logFd != null) fs.closeSync(logFd);
+  }
 }
 
 function parseLocalDate(value) {
@@ -350,31 +442,71 @@ function run(bin, args, opts = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, { stdio: opts.stdio || 'inherit' });
     let timer = null;
+    let killTimer = null;
+    let timedOut = false;
     if (opts.timeout && opts.timeout > 0) {
       timer = setTimeout(() => {
+        timedOut = true;
         child.kill('SIGTERM');
-        reject(new Error(`Timeout: ${bin} exceeded ${opts.timeout}ms`));
+        killTimer = setTimeout(() => child.kill('SIGKILL'), 10_000);
       }, opts.timeout);
     }
     child.on('error', err => {
       if (timer) clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       reject(err);
     });
     child.on('close', code => {
       if (timer) clearTimeout(timer);
-      code === 0 ? resolve() : reject(new Error(`${bin} exited ${code}`));
+      if (killTimer) clearTimeout(killTimer);
+      if (timedOut) {
+        reject(new Error(`Timeout: ${bin} exceeded ${opts.timeout}ms`));
+      } else {
+        code === 0 ? resolve() : reject(new Error(`${bin} exited ${code}`));
+      }
     });
   });
 }
 
-async function validMedia(file, ffprobe) {
-  if (!fs.existsSync(file)) return false;
-  try {
-    await run(ffprobe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', file], { stdio: 'ignore' });
-    return true;
-  } catch {
-    return false;
+function probeMediaDuration(file, ffprobe) {
+  return new Promise(resolve => {
+    if (!fs.existsSync(file)) {
+      resolve(null);
+      return;
+    }
+    const child = spawn(ffprobe, [
+      '-v', 'error',
+      '-show_entries', 'format=duration',
+      '-of', 'default=nw=1:nk=1',
+      file,
+    ], { stdio: ['ignore', 'pipe', 'ignore'] });
+    let stdout = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.on('error', () => resolve(null));
+    child.on('close', code => {
+      const durationSec = Number.parseFloat(stdout.trim());
+      resolve(code === 0 && Number.isFinite(durationSec) && durationSec > 0 ? durationSec : null);
+    });
+  });
+}
+
+async function validateMedia(file, expectedDurationSec, ffprobe) {
+  const actualDurationSec = await probeMediaDuration(file, ffprobe);
+  if (actualDurationSec == null) {
+    return { complete: false, actualDurationSec: null, toleranceSec: null };
   }
+  if (!(expectedDurationSec > 0)) {
+    return { complete: true, actualDurationSec, toleranceSec: null };
+  }
+  // TS timestamps and playlist rounding can differ slightly. Cap tolerance so a
+  // genuinely truncated long recording can never pass merely because it plays.
+  const toleranceSec = Math.max(2, Math.min(30, expectedDurationSec * 0.002));
+  return {
+    complete: actualDurationSec >= expectedDurationSec - toleranceSec,
+    actualDurationSec,
+    toleranceSec,
+  };
 }
 
 async function mapLimit(items, limit, mapper) {
@@ -595,12 +727,12 @@ async function processOne(live, opts, fetchDetail) {
   const dir = path.join(opts.outRoot, opts.member, tsTime);
   await fsp.mkdir(dir, { recursive: true });
 
-  // --- 解析 M3U8 + 实测速度 + 估算超时 ---
+  // --- 解析 M3U8 + 实测速度 + 参考下载时间 ---
   let preciseDurationSec = null;
   let startTimestamp = null;
   let endTimestamp = null;
   let speedFactor = null;
-  let timeoutMs = null;
+  const timeoutMs = opts.timeoutMinutes ? Math.ceil(opts.timeoutMinutes * 60_000) : null;
 
   if (m3u8) {
     try {
@@ -634,12 +766,10 @@ async function processOne(live, opts, fetchDetail) {
           const bwSec = preciseDurationSec / speedFactor;
           const overheadSec = parsed.segmentCount * PER_SEGMENT_OVERHEAD_SEC;
           const estimatedSec = bwSec + overheadSec;
-          timeoutMs = Math.ceil(estimatedSec * 1.5 * 1000);
           console.log(` 下载速度:    ${speedInfo.speedMbps.toFixed(1)} Mbps`);
           console.log(` 预估倍速:    ${speedFactor.toFixed(1)}x`);
           console.log(` 分片开销:    ~${Math.ceil(overheadSec / 60)} 分钟 (${parsed.segmentCount}×${PER_SEGMENT_OVERHEAD_SEC}s)`);
-          console.log(` 预估下载:    ~${Math.ceil(estimatedSec / 60)} 分钟`);
-          console.log(` 建议超时:    ${Math.ceil(timeoutMs / 60000)} 分钟 (${timeoutMs}ms)`);
+          console.log(` 参考预估:    ~${Math.ceil(estimatedSec / 60)} 分钟（仅供参考，不会自动终止下载）`);
         }
       }
       if (!speedFactor) {
@@ -647,12 +777,13 @@ async function processOne(live, opts, fetchDetail) {
         const bwSec = preciseDurationSec / speedFactor;
         const overheadSec = parsed.segmentCount * PER_SEGMENT_OVERHEAD_SEC;
         const estimatedSec = bwSec + overheadSec;
-        timeoutMs = Math.ceil(estimatedSec * 1.5 * 1000);
         console.log(` 下载速度:    实测失败，使用保守估计 ${speedFactor}x`);
         console.log(` 分片开销:    ~${Math.ceil(overheadSec / 60)} 分钟 (${parsed.segmentCount}×${PER_SEGMENT_OVERHEAD_SEC}s)`);
-        console.log(` 预估下载:    ~${Math.ceil(estimatedSec / 60)} 分钟`);
-        console.log(` 建议超时:    ${Math.ceil(timeoutMs / 60000)} 分钟 (${timeoutMs}ms)`);
+        console.log(` 参考预估:    ~${Math.ceil(estimatedSec / 60)} 分钟（仅供参考，不会自动终止下载）`);
       }
+      console.log(timeoutMs
+        ? ` 总时限:      ${opts.timeoutMinutes} 分钟（用户显式设置）`
+        : ' 总时限:      不限制（网络停滞仍由 ffmpeg rw_timeout 处理）');
       console.log('='.repeat(60));
       console.log('');
     } catch (e) {
@@ -670,39 +801,45 @@ async function processOne(live, opts, fetchDetail) {
   if (opts.downloadVideo && m3u8) {
     outVideo = path.join(dir, `[口袋48录播]_${nickname}_${title}_${tsTime}_${live.liveId}.ts`);
     const part = `${outVideo}.part`;
-    if (await validMedia(outVideo, opts.ffprobe)) {
+    const existingValidation = await validateMedia(outVideo, preciseDurationSec, opts.ffprobe);
+    if (existingValidation.complete) {
       console.log(`SKIP VIDEO ${live.liveId} ${outVideo}`);
     } else {
+      if (fs.existsSync(outVideo)) {
+        const actual = existingValidation.actualDurationSec == null
+          ? '无法读取'
+          : formatDurationPrecise(existingValidation.actualDurationSec);
+        const expected = preciseDurationSec > 0 ? formatDurationPrecise(preciseDurationSec) : '未知';
+        console.log(`  INCOMPLETE existing video: actual=${actual}, expected=${expected}; redownloading`);
+      }
       console.log(`DOWNLOAD VIDEO ${live.liveId} -> ${outVideo}`);
       downloadStartTime = Date.now();
       try {
-        await run(opts.ffmpeg, ['-hide_banner', '-nostdin', '-y', '-rw_timeout', '300000000', '-user_agent', 'SNH48 ENGINE', '-i', m3u8, '-c', 'copy', '-f', 'mpegts', part], { timeout: timeoutMs });
+        const ffmpegArgs = [
+          '-hide_banner', '-nostdin', '-y',
+          ...(opts.verboseFfmpeg ? [] : ['-nostats', '-loglevel', 'warning']),
+          '-rw_timeout', '300000000',
+          '-user_agent', 'SNH48 ENGINE',
+          '-i', m3u8,
+          '-c', 'copy', '-f', 'mpegts', part,
+        ];
+        await run(opts.ffmpeg, ffmpegArgs, { timeout: timeoutMs });
       } catch (e) {
-        // 如果是超时 kill，检查 part 是否可播放（可能已经下载了足够内容）
-        if (e.message?.includes('Timeout')) {
-          console.log(`  TIMEOUT ${live.liveId} (${Math.ceil(timeoutMs / 60000)} 分钟已到)`);
-          if (fs.existsSync(part) && fs.statSync(part).size > 1024 * 1024) {
-            console.log(`  部分文件 ${part} 存在，尝试重命名...`);
-            await fsp.rename(part, outVideo);
-            if (!(await validMedia(outVideo, opts.ffprobe))) {
-              console.log(`  部分文件不可播放，删除`);
-              await fsp.rm(outVideo, { force: true });
-              throw e;
-            }
-            console.log(`  部分文件可播放，保留`);
-          } else {
-            console.log(`  超时文件太小，删除`);
-            await fsp.rm(part, { force: true });
-            throw e;
-          }
-        } else {
-          throw e;
-        }
+        const partSize = fs.existsSync(part) ? fs.statSync(part).size : 0;
+        console.error(`  DOWNLOAD FAILED ${live.liveId}: ${e.message}`);
+        if (partSize > 0) console.error(`  Incomplete data kept for inspection: ${part} (${partSize} bytes)`);
+        throw e;
       }
-      if (fs.existsSync(part)) {
-        await fsp.rename(part, outVideo);
+      const partValidation = await validateMedia(part, preciseDurationSec, opts.ffprobe);
+      if (!partValidation.complete) {
+        const actual = partValidation.actualDurationSec == null
+          ? 'unreadable'
+          : `${partValidation.actualDurationSec.toFixed(3)}s`;
+        throw new Error(`duration validation failed for ${part}: actual=${actual}, expected=${preciseDurationSec ?? 'unknown'}s`);
       }
-      if (!(await validMedia(outVideo, opts.ffprobe))) throw new Error(`ffprobe validation failed: ${outVideo}`);
+      // Preserve an older bad file until a complete replacement has been verified.
+      await fsp.rm(outVideo, { force: true });
+      await fsp.rename(part, outVideo);
       const downloadElapsed = (Date.now() - downloadStartTime) / 1000;
       if (preciseDurationSec && preciseDurationSec > 0 && downloadElapsed > 0) {
         const actualSpeed = preciseDurationSec / downloadElapsed;
@@ -764,7 +901,16 @@ async function processOne(live, opts, fetchDetail) {
 }
 
 async function main() {
-  const opts = parseArgs(process.argv.slice(2));
+  const rawArgs = process.argv.slice(2);
+  const opts = parseArgs(rawArgs);
+  if (opts.help) {
+    usage();
+    return;
+  }
+  if (opts.background) {
+    await launchBackground(rawArgs, opts);
+    return;
+  }
   opts.ffmpeg ||= defaultFfmpeg();
   opts.ffprobe ||= defaultFfprobe();
 
@@ -820,8 +966,52 @@ async function main() {
   console.log(`ALL_DONE ${results.length}/${lives.length}`);
 }
 
-main().catch(err => {
-  usage();
-  console.error(err.stack || err.message || String(err));
-  process.exit(1);
-});
+async function runProgram() {
+  const statusFile = process.env.POCKET48_JOB_STATUS_FILE;
+  try {
+    if (statusFile) {
+      await mergeJsonFile(statusFile, {
+        state: 'running',
+        pid: process.pid,
+        startedAt: process.env.POCKET48_JOB_STARTED_AT || new Date().toISOString(),
+      });
+    }
+    await main();
+    if (statusFile) {
+      await mergeJsonFile(statusFile, {
+        state: 'done',
+        finishedAt: new Date().toISOString(),
+        exitCode: 0,
+      });
+    }
+  } catch (err) {
+    if (statusFile) {
+      await mergeJsonFile(statusFile, {
+        state: 'failed',
+        finishedAt: new Date().toISOString(),
+        exitCode: 1,
+        error: String(err?.message || err).slice(0, 1000),
+      });
+    }
+    usage();
+    console.error(err.stack || err.message || String(err));
+    process.exitCode = 1;
+  }
+}
+
+export { parseArgs, validateMedia };
+
+function isMainModule() {
+  if (!process.argv[1]) return false;
+  try {
+    const invokedPath = fs.realpathSync(path.resolve(process.argv[1]));
+    const modulePath = fs.realpathSync(fileURLToPath(import.meta.url));
+    return invokedPath === modulePath;
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  runProgram();
+}
