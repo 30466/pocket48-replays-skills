@@ -161,7 +161,8 @@ node /Users/cbj/Documents/48/skills/pocket48-replays/scripts/download_pocket48_l
 | `--group-id N` | Filter by team (10=SNH48, 21=CGT48, 12=GNZ48, etc.) |
 | `--out-root DIR` | Output directory |
 | `--member-source URL\|FILE` | Member map source, default `https://abm48.com/api/public/snh48/room-map` |
-| `--concurrency N` | Parallel downloads, default 1 |
+| `--concurrency N` | Parallel **recordings** (not segments), default 1 |
+| `--segment-concurrency N` | Parallel **segments within one recording**, default 64; `1` = serial (range 1-128) |
 | `--info-only` | Show all metadata fields, no download |
 | `--download-video` | Download video/audio stream (default: true) |
 | `--no-video` / `--skip-video` | Skip video download; combine with `--download-danmaku` and/or `--download-cover` |
@@ -225,7 +226,28 @@ The script resolves member names to Pocket48 userIds automatically in this order
 - Incomplete `.part` downloads stay marked as partial and are overwritten on re-run
 - Metadata JSON is always saved alongside downloads
 - Danmaku files are in standard LRC format, one line per danmaku
-- `--concurrency 2-3` practical range for parallel downloads
+- `--concurrency 2-3` practical range when downloading multiple recordings at once
+- **Download pipeline (single mode)**: parse m3u8 → fetch all segments in parallel → write a local playlist → ffmpeg remuxes locally. ffmpeg never touches the network for video, so the mux step takes seconds.
+- `--segment-concurrency` (default **64**, `1` = serial) controls segment parallelism. Measured against the Pocket48 CDN from a Macau/CTM line:
+
+  | Concurrency | Median | Spread (min→max) |
+  |---|---|---|
+  | 16 | 43 Mbps | 3.6x |
+  | 32 | 63 Mbps | 1.7x |
+  | **64** | **74 Mbps** | **1.2x** |
+
+  Higher concurrency is both faster *and* far more stable: with more requests in flight, one slow segment no longer stalls the whole download.
+- **Whole-recording benchmarks** — these are the reliable numbers. Per-slice micro-benchmarks are misleading because a slice's wall time is set by its single slowest segment:
+
+  | Recording | Segments | Size | Duration | Concurrency | Time | Speed |
+  |---|---|---|---|---|---|---|
+  | 09-16 | 836 | 1.86 GB | 83:27 | 64 | **123 s** | **42.9x** |
+  | 09-19 | 887 | 1.87 GB | 88:31 | 32 | 174 s | 33.2x |
+  | 09-18 | 857 | 1.81 GB | 85:36 | 16 | 359 s | 14.3x |
+
+- **Resume**: already-downloaded segments are skipped, so an interrupted run only re-fetches what is missing (measured: 359 s → 11 s).
+- **Partial failures never abort the download**: failed segments get a second retry pass, then are dropped from the playlist with a warning so ffmpeg can still concatenate continuously. ffmpeg itself cannot skip a permanently-failed segment — `-seg_max_retry` only retries, so the skip logic has to live in the script.
+- Segment cache lives in `.segments_<liveId>/` next to the output and is deleted after a successful remux; it is kept on failure so a re-run can resume.
 - `--group-id` overrides the member filter to team-wide scope (useful for browsing)
 - `--member-source` accepts a URL or local JSON file; compatible with both `{name: id}` flat dict and `roomId.json` array format
 - Each request uses a random `deviceId` to avoid triggering rate limits
@@ -259,9 +281,53 @@ LOG /Users/cbj/Documents/48/.pocket48-replays/jobs/<job-id>.log
 - `--dry-run`、`--info-only` 这类短任务直接前台运行即可。
 - 如果用户要求一直等到完成，轮询状态 JSON（建议 30–60 秒一次），不要持续流式读取日志，也不要让一次工具调用挂住整个下载时长。
 
-### 超时策略
+### 超时与重试策略
 
-默认**不设人工总时限**。ffmpeg 仍通过 `-rw_timeout` 处理长时间无网络数据的连接，但脚本不再根据单个分片的瞬时速度计算时限并主动杀进程。测速结果只用于展示参考下载时间。
+默认**不设人工总时限**，也不根据任何速度估算去杀进程。真正起作用的是三层机制：
+
+| 机制 | 值 | 解决什么 |
+|---|---|---|
+| **空闲超时** | **15s 无新数据** | 连接卡死 → 立刻放弃、释放并发槽位 |
+| 硬上限 | 60s | 安全网（有空闲超时后几乎不会触发） |
+| 重试 | 3 次 × 2 遍 | 瞬时抖动 → 重试时通常已热缓存，飞快 |
+| 第二遍预算 | 180s | 失败分片很多时保证总耗时封顶 |
+
+> **为什么用「空闲超时」而不是「总时长超时」**：总时长超时会误杀「慢但在正常传」的分片，
+> 然后从头重下，反而更糟。空闲超时只看“多久没收到新数据”，慢分片只要还在动就不会被杀。
+>
+> **为什么不能只靠重试次数**：Node 的 `fetch` 默认没有任何超时。连接卡死时它既不报错也不返回，
+> 根本不会触发重试，只会永久占着并发槽位。
+
+#### 重试白名单
+
+**只有下列「已知可恢复」的失败才重试，其余一律立刻跳过** —— 用白名单而非黑名单，
+是为了遇到没预料到的错误时默认行为是「跳过继续」，绝不会卡在未知情况上。
+
+| 重试 | 不重试 |
+|---|---|
+| HTTP 5xx（服务端临时故障） | HTTP 4xx（**含 478 资源已删除**）、404、403 |
+| HTTP 429（限流，退避后可能就好） | 任何超时 / 连接黑洞（一次 11~15s，重试代价高） |
+| 瞬时网络错误（ECONNRESET / socket hang up） | 耗时超过 8s 的失败 |
+| DNS 临时失败（EAI_AGAIN） | **任何未识别的错误类型**（记录为「其他: xxx」） |
+
+> `478` 是这个 CDN 对「资源不存在」的自定义码。实测依据：30 路并发请求真实分片全部返回 200
+> （排除限流），假的路径/目录才返回 478，响应体恒为 46 字节；且单次耗时 1.0~2.0s
+> （CDN 要先回源确认），所以重试它既不便宜也没意义。
+
+#### 失败一定会报告
+
+单个分片最终失败不会被静默吞掉，三处可见：
+
+1. **控制台/日志按原因分类汇总**：
+
+   ```
+   ⚠ 221/887 个分片最终失败（约 1326 秒内容缺失），已从清单剔除以保证连续拼接
+      失败原因: 478 资源已删除 × 215  |  连接超时 × 6
+      完整列表: .../2026-09-19~23.12.48.failed-segments.txt
+   ```
+
+2. **同目录下的 `*.failed-segments.txt`** — 每行是 `分片名 / 原因 / 底层错误 / URL`，重跑前能查。
+3. **时长校验失败时**会明确说明「因为 N 个分片缺失，所以时长对不上」，并提示断点续传只需补下缺失的那几个。
 
 只有用户明确希望设置硬上限时才传：
 
@@ -271,21 +337,31 @@ LOG /Users/cbj/Documents/48/.pocket48-replays/jobs/<job-id>.log
 
 触发硬上限或 ffmpeg 出错时，`.part` 文件不会被改名成正式 `.ts`。任务会标记为失败，避免把截断但可播放的文件误报为成功。
 
-## 下载前展示、测速与完整性保护
+## 下载前展示与完整性保护
 
 在每次下载前，脚本会：
 
 1. **调用 `getLiveOne`** 获取回放详细信息
-2. **解析 M3U8** — 获取精确时长（`#EXTINF` 累加）、精确开始/结束时间（首分片 `startTimestamp` + 推算）和分片总数
-3. **实测下载速度** — 下载第一个 TS 分片，计算 `分片时长 / 实际下载耗时 → 倍速`，并显示 Mbps
-4. **估算下载时间** — 基于实测倍速给出参考值，但不以此控制进程寿命
-5. **调用 ffmpeg** — 默认自然下载完成；仅在显式设置 `--timeout-minutes` 时执行总时限
-6. **下载后校验完整时长** — 使用 ffprobe 比较文件实际时长与 M3U8 精确时长，通过后才把 `.part` 改为正式 `.ts`
-7. **下载完后** — 输出实际下载速度（如 `实际速度: 14.2x`）
+2. **解析 M3U8** — 获取精确时长（`#EXTINF` 累加）、精确开始/结束时间（首分片 `startTimestamp` + 推算）、分片总数，以及全部分片 URL
+3. **开始并行下载分片** — 边下边显示实时进度（已下分片数 / 总字节 / 当前速度 / 剩余时间）。**不做预探测**：预探测会白下几十 MB、还要干等几十秒，而且猜出来的数字并不准；真实吞吐在下载启动后 1 秒内就能算出来
+4. **本地封装** — 把所有到手的分片写成本地播放列表，交给 ffmpeg 做纯本地拼接（不走网络，实测 0.2~1 秒）
+5. **下载后校验完整时长** — 使用 ffprobe 比较文件实际时长与 M3U8 精确时长，通过后才把 `.part` 改为正式 `.ts`
+6. **输出实际速度与耗时**，例如：
 
-> **分片开销补偿**：每分片追加 0.1s 的 HTTP 往返预估。2651 个分片≈ +4.4 分钟，使整体估算更贴近实际（单分片测速只反映纯带宽，未计请求/响应/对齐开销）。
->
-> 如果测速失败（CDN 限制等），回退到保守 8x 估计 + 分片开销。该估计仅供展示，不会触发自动终止。
+   ```
+   DONE VIDEO 1310392482355023872 (实际速度: 64.2x)
+     本场耗时: 下载 27.2s + 封装 0.4s  |  628 MB  |  下载速率 23.1 MB/s
+     本场合计: 00:28  (含获取元数据 / 弹幕 / 封面)
+   ```
+
+   多场下载全部结束后还会给出总计：
+
+   ```
+   ALL_DONE 7/7
+     总计: 7.24 GB  |  耗时 03:24  |  平均 35.7 MB/s
+   ```
+
+> 并行下载期间屏幕上只有一行实时进度，不会刷屏。ffmpeg 本地封装的输出默认被收起，只在失败时抖出尾部；遇到分片边界的时间戳重叠 / 损坏包会压缩成一行提示（ffmpeg 自动修正，不影响播放）。
 
 ## 下载后保存的文件
 
@@ -298,6 +374,8 @@ LOG /Users/cbj/Documents/48/.pocket48-replays/jobs/<job-id>.log
 | `*.lrc` | 弹幕文件（LRC 格式，`--download-danmaku` 时生成） |
 | `*.jpg` | 封面图片（`--download-cover` 或 `--download-all` 时下载） |
 | `*.info.txt` | **中文标签信息文件**（Human-readable，所有字段含中文说明） |
+| `*.failed-segments.txt` | 分片下载失败清单（仅在有失败时生成，含原因 / 底层错误 / URL） |
+| `.segments_<liveId>/` | 分片缓存目录。封装成功后自动删除；失败时保留，重跑可断点续传 |
 
  `.info.txt` 文件内容示例：
 ```
