@@ -570,13 +570,17 @@ const SEGMENT_IDLE_TIMEOUT_MS = 15_000;
 // 空闲超时生效时这个几乎不会触发。
 const SEGMENT_HARD_TIMEOUT_MS = 60_000;
 
-// 单个分片的重试次数（单趟内）
-const SEGMENT_RETRIES = 3;
+// 单个分片的尝试次数（含首次）。
+// 本地下载器始终直连 Pocket48 CDN；网页版的同源代理不适用于这里。
+const SEGMENT_RETRIES = 5;
+
+// 第二遍是异常分片的收尾阶段，降低并发可避免再次向同一 HTTP/2
+// 连接瞬间压入 64+ 个流。网页版默认 10，这里取 16 兼顾速度。
+const SEGMENT_RETRY_CONCURRENCY = 16;
 
 // 第二遍（只重试失败分片）的总时间预算。
-// 没有这个预算的话，「连上但不发数据」的坏死分片会拖很久：
-//   9 次尝试 × 60s 硬上限 ≈ 9 分钟。
-// 加上预算后，最坏情况被钉在「首遍 ≤60s + 重试 ≤180s」≈ 4 分钟。
+// 没有这个预算的话，「连上但不发数据」的坏死分片会拖很久。
+// 预算用于防止第二遍继续启动新任务；已启动的尝试仍会正常收尾。
 const RETRY_PASS_BUDGET_MS = 180_000;
 
 function resolveSegmentUrl(m3u8Url, segPath) {
@@ -622,47 +626,37 @@ async function fetchSegmentWithIdleTimeout(url) {
   }
 }
 
-// 超过这个秒数的失败算「慢失败」（超时 / 连接不通），重试代价高
-const SLOW_FAILURE_SEC = 8;
+function errorText(e) {
+  if (e instanceof AggregateError) {
+    return e.errors.map((item) => errorText(item)).filter(Boolean).join(' | ') || e.message;
+  }
+  return [e?.message, e?.code, e?.cause?.code, e?.cause?.message]
+    .filter(Boolean)
+    .join(' ')
+    || String(e || 'unknown');
+}
 
 /**
- * 判断一次失败值不值得重试。两条规则：
+ * 判断一次失败值不值得重试。
  *
- * ① 慢失败不重试（tookSec > SLOW_FAILURE_SEC）
- *    连接黑洞 / 连不上：一次要 11~15 秒，重试 6 次就是白等 1.5 分钟。
+ * HTTP 4xx（除 429）和本地文件系统错误重试没有意义；其他失败默认
+ * 视为瞬时链路故障。特别是 idle timeout 和 ERR_HTTP2_STREAM_ERROR，
+ * 换一次新的直连请求就有很高概率恢复。
  *
- * ② 只有白名单里的错误才重试 —— 4xx（含 478）一律跳过。
+ * 4xx（含 478）一律跳过：
  *    实测 Pocket48 CDN 对不存在的分片返回 478，响应体恒为 46 字节，
  *    而 30 路并发请求真分片全部 200 —— 所以 478 是「已删除」，不是限流。
  *    而且 478 单次就要 1.0~2.0 秒（CDN 要先回源确认），重试并不便宜。
  */
-function isTimeoutFailure(e) {
-  const text = `${e?.message || e} ${e?.cause?.message || ''}`;
-  return /idle timeout|hard timeout|AbortError|aborted|operation was aborted/i.test(text);
+function shouldRetry(e) {
+  if (e instanceof AggregateError) return e.errors.some((item) => shouldRetry(item));
+  const text = errorText(e);
+  if (/HTTP 4\d\d/.test(text) && !/HTTP 429/.test(text)) return false;
+  if (/\b(?:EACCES|EPERM|ENOSPC|EROFS|EMFILE|ENFILE)\b/.test(text)) return false;
+  return true;
 }
 
-/**
- * 只有这些「已知可恢复」的失败才重试；其余一律立刻跳过。
- *
- * 用白名单而不是黑名单的原因：遇到没预料到的错误类型时，
- * 默认行为是「跳过继续」而不是「去重试」，因此绝不会卡在未知情况上。
- */
-const RETRYABLE_PATTERNS = [
-  /HTTP 5\d\d/,                        // 服务器临时故障
-  /HTTP 429/,                          // 被限流，退避后可能就好
-  /ECONNRESET|ECONNREFUSED|EPIPE|ERR_STREAM_PREMATURE_CLOSE/i, // 瞬时网络
-  /socket hang up|other side closed|UND_ERR_SOCKET|UND_ERR_CONNECT_TIMEOUT/i,
-  /EAI_AGAIN|getaddrinfo/i,            // DNS 临时失败（ENOTFOUND 是永久的不在列）
-];
-
-function shouldRetry(e, tookSec) {
-  if (tookSec > SLOW_FAILURE_SEC) return false;   // 慢失败 → 代价高，跳过
-  if (isTimeoutFailure(e)) return false;          // 卡死 → 跳过
-  const text = `${e?.message || e} ${e?.cause?.message || ''}`;
-  return RETRYABLE_PATTERNS.some((re) => re.test(text));
-}
-
-async function downloadOneSegment(url, dest, retries = 3) {
+async function downloadOneSegment(url, dest, retries = SEGMENT_RETRIES) {
   try {
     const st = await fsp.stat(dest);
     if (st.size > 0) return { skipped: true, bytes: 0 };
@@ -671,7 +665,6 @@ async function downloadOneSegment(url, dest, retries = 3) {
   let lastErr = null;
   for (let attempt = 1; attempt <= retries; attempt++) {
     const tmp = `${dest}.tmp`;
-    const attemptStart = Date.now();
     try {
       const buf = await fetchSegmentWithIdleTimeout(url);
       if (buf.length === 0) throw new Error('empty body');
@@ -680,22 +673,15 @@ async function downloadOneSegment(url, dest, retries = 3) {
       return { skipped: false, bytes: buf.length };
     } catch (e) {
       lastErr = e;
-      const tookSec = (Date.now() - attemptStart) / 1000;
       await fsp.rm(tmp, { force: true });
-      if (!shouldRetry(e, tookSec)) break;
+      if (!shouldRetry(e)) break;
       if (attempt < retries) await new Promise((r) => setTimeout(r, 400 * attempt));
     }
   }
   const err = new Error(`${url.split('/').pop()}: ${lastErr?.message || 'unknown'}`);
   // undici 把真正的细节（ETIMEDOUT / ECONNRESET 等）藏在 cause 里，
   // 只取 message 会得到无信息的 "fetch failed"，没法归类。
-  const cause = lastErr?.cause;
-  err.rawMessage = [
-    lastErr?.message,
-    cause?.code,
-    cause?.message,
-    typeof cause === 'string' ? cause : null,
-  ].filter(Boolean).join(' ') || 'unknown';
+  err.rawMessage = errorText(lastErr);
   throw err;
 }
 
@@ -715,6 +701,7 @@ function classifyFailure(msg) {
   if (/ETIMEDOUT|UND_ERR_CONNECT_TIMEOUT|connect timeout/i.test(m)) return '连接超时';
   if (/EHOSTUNREACH|ENETUNREACH|ENETDOWN/i.test(m)) return '网络不可达';
   if (/EAI_AGAIN|getaddrinfo|ENOTFOUND/i.test(m)) return 'DNS 失败';
+  if (/ERR_HTTP2_STREAM_ERROR|NGHTTP2_/i.test(m)) return 'HTTP/2 流错误';
   if (/ECONNRESET|ECONNREFUSED|socket hang up|other side closed|UND_ERR/i.test(m)) return '连接被重置';
   if (/aborted|AbortError/i.test(m)) return '被中断';
   if (/empty body/i.test(m)) return '空响应';
@@ -761,9 +748,8 @@ async function downloadVideoParallel(segments, segDir, concurrency, onProgress) 
     onProgress({ phase: 2, done: 0, total: firstPass.size, bytes, failed: firstPass.size });
   }
   if (firstPass.size > 0) {
-    // 并发度和第一遍一致：坏分片多的时候（比如 25%），
-    // 只开 8 路会把重试阶段拖成瓶颈（222 个坏分片需 8 路 × 每片数秒）。
-    await mapLimit([...firstPass], concurrency, async (i) => {
+    const retryConcurrency = Math.min(concurrency, SEGMENT_RETRY_CONCURRENCY);
+    await mapLimit([...firstPass], retryConcurrency, async (i) => {
       if (Date.now() > retryDeadline) {
         stillFailed.add(i);
         return;
@@ -1045,7 +1031,7 @@ async function processOne(live, opts, fetchDetail) {
       // 所以直接在下方实时进度里显示「速度 + 剩余时间」。
       console.log(timeoutMs
         ? ` 总时限:      ${opts.timeoutMinutes} 分钟（用户显式设置）`
-        : ` 分片策略: 每个分片 ${SEGMENT_IDLE_TIMEOUT_MS / 1000}s 无数据则重试（最多 ${SEGMENT_RETRIES} 次）`
+        : ` 分片策略: 每片最多 ${SEGMENT_RETRIES} 次直连尝试，单次 ${SEGMENT_IDLE_TIMEOUT_MS / 1000}s 无数据则取消`
           + `；失败分片第二遍重试，预算 ${RETRY_PASS_BUDGET_MS / 60_000} 分钟，仍失败则剔除并继续`);
       console.log('='.repeat(60));
       console.log('');
@@ -1064,8 +1050,13 @@ async function processOne(live, opts, fetchDetail) {
   if (opts.downloadVideo && m3u8) {
     outVideo = path.join(dir, `[口袋48录播]_${nickname}_${title}_${tsTime}_${live.liveId}.ts`);
     const part = `${outVideo}.part`;
+    const segDir = path.join(dir, `.segments_${live.liveId}`);
+    const failedSegmentsPath = path.join(dir, `${tsTime}.failed-segments.txt`);
     const existingValidation = await validateMedia(outVideo, preciseDurationSec, opts.ffprobe);
     if (existingValidation.complete) {
+      // 正式文件已验证完整，此时才能安全清理旧缓存和失败清单。
+      await fsp.rm(segDir, { recursive: true, force: true });
+      await fsp.rm(failedSegmentsPath, { force: true });
       console.log(`SKIP VIDEO ${live.liveId} ${outVideo}`);
     } else {
       if (fs.existsSync(outVideo)) {
@@ -1089,7 +1080,6 @@ async function processOne(live, opts, fetchDetail) {
       let droppedCount = 0;
       let droppedSec = 0;
       try {
-        const segDir = path.join(dir, `.segments_${live.liveId}`);
         const dlStart = Date.now();
         let lastPrint = 0;
         let lastPct = -1;
@@ -1152,7 +1142,6 @@ async function processOne(live, opts, fetchDetail) {
           console.warn(`    失败原因: ${summary}`);
 
           // 全量列表写文件，不占屏幕但重跑前能查
-          const failFile = path.join(dir, `${tsTime}.failed-segments.txt`);
           const lines = [
             `# ${nickname} / ${title}`,
             `# liveId: ${live.liveId}`,
@@ -1166,8 +1155,8 @@ async function processOne(live, opts, fetchDetail) {
               `${f.name}\t${classifyFailure(f.reason)}\t${f.reason.slice(0, 80)}\t${f.url || ''}`),
           ];
           try {
-            await fsp.writeFile(failFile, `${lines.join('\n')}\n`, 'utf8');
-            console.warn(`    完整列表: ${failFile}`);
+            await fsp.writeFile(failedSegmentsPath, `${lines.join('\n')}\n`, 'utf8');
+            console.warn(`    完整列表: ${failedSegmentsPath}`);
           } catch { /* 写不了文件不影响下载 */ }
         }
         if (stats.usable.length === 0) {
@@ -1216,7 +1205,6 @@ async function processOne(live, opts, fetchDetail) {
             console.log('  封装提示: 分片边界有少量时间戳重叠 / 损坏包，ffmpeg 已自动修正（不影响播放）');
           }
         }
-        await fsp.rm(segDir, { recursive: true, force: true });
       } catch (e) {
         const partSize = fs.existsSync(part) ? fs.statSync(part).size : 0;
         console.error(`  DOWNLOAD FAILED ${live.liveId}: ${e.message}`);
@@ -1243,6 +1231,9 @@ async function processOne(live, opts, fetchDetail) {
       // Preserve an older bad file until a complete replacement has been verified.
       await fsp.rm(outVideo, { force: true });
       await fsp.rename(part, outVideo);
+      // 分片必须保留到时长校验通过；否则断点续传只是一句空话。
+      await fsp.rm(segDir, { recursive: true, force: true });
+      await fsp.rm(failedSegmentsPath, { force: true });
       const downloadElapsed = (Date.now() - downloadStartTime) / 1000;
       const speedTag = (preciseDurationSec && preciseDurationSec > 0 && downloadElapsed > 0)
         ? ` (实际速度: ${(preciseDurationSec / downloadElapsed).toFixed(1)}x)`
@@ -1440,9 +1431,11 @@ export {
   downloadOneSegment,
   downloadVideoParallel,
   classifyFailure,
+  shouldRetry,
   SEGMENT_IDLE_TIMEOUT_MS,
   SEGMENT_HARD_TIMEOUT_MS,
   SEGMENT_RETRIES,
+  SEGMENT_RETRY_CONCURRENCY,
   RETRY_PASS_BUDGET_MS,
 };
 

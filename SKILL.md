@@ -246,8 +246,8 @@ The script resolves member names to Pocket48 userIds automatically in this order
   | 09-18 | 857 | 1.81 GB | 85:36 | 16 | 359 s | 14.3x |
 
 - **Resume**: already-downloaded segments are skipped, so an interrupted run only re-fetches what is missing (measured: 359 s → 11 s).
-- **Partial failures never abort the download**: failed segments get a second retry pass, then are dropped from the playlist with a warning so ffmpeg can still concatenate continuously. ffmpeg itself cannot skip a permanently-failed segment — `-seg_max_retry` only retries, so the skip logic has to live in the script.
-- Segment cache lives in `.segments_<liveId>/` next to the output and is deleted after a successful remux; it is kept on failure so a re-run can resume.
+- **Partial failures never abort the download**: each segment gets up to 5 direct-download attempts. Remaining failures get a lower-concurrency second pass, then are dropped from the playlist with a warning so ffmpeg can still concatenate continuously. ffmpeg itself cannot skip a permanently-failed segment — `-seg_max_retry` only retries, so the skip logic has to live in the script.
+- Segment cache lives in `.segments_<liveId>/` next to the output and is deleted only after the remux passes the final duration check; it is kept on failure so a re-run can resume.
 - `--group-id` overrides the member filter to team-wide scope (useful for browsing)
 - `--member-source` accepts a URL or local JSON file; compatible with both `{name: id}` flat dict and `roomId.json` array format
 - Each request uses a random `deviceId` to avoid triggering rate limits
@@ -287,28 +287,30 @@ LOG /Users/cbj/Documents/48/.pocket48-replays/jobs/<job-id>.log
 
 | 机制 | 值 | 解决什么 |
 |---|---|---|
-| **空闲超时** | **15s 无新数据** | 连接卡死 → 立刻放弃、释放并发槽位 |
+| **空闲超时** | **15s 无新数据** | 连接卡死 → 取消本次尝试、释放并发槽位 |
 | 硬上限 | 60s | 安全网（有空闲超时后几乎不会触发） |
-| 重试 | 3 次 × 2 遍 | 瞬时抖动 → 重试时通常已热缓存，飞快 |
+| 重试 | 5 次 × 最多 2 遍 | 全部直连 Pocket48 CDN，瞬时超时和 HTTP/2 流错误也会重试 |
+| 收尾并发 | 最多 16 | 避免 64+ 个异常分片同时再次压迫同一 HTTP/2 连接 |
 | 第二遍预算 | 180s | 失败分片很多时保证总耗时封顶 |
 
 > **为什么用「空闲超时」而不是「总时长超时」**：总时长超时会误杀「慢但在正常传」的分片，
 > 然后从头重下，反而更糟。空闲超时只看“多久没收到新数据”，慢分片只要还在动就不会被杀。
 >
 > **为什么不能只靠重试次数**：Node 的 `fetch` 默认没有任何超时。连接卡死时它既不报错也不返回，
-> 根本不会触发重试，只会永久占着并发槽位。
+> 根本不会触发重试，只会永久占着并发槽位。超时本身是可重试的瞬时错误。
 
-#### 重试白名单
+#### 重试规则
 
-**只有下列「已知可恢复」的失败才重试，其余一律立刻跳过** —— 用白名单而非黑名单，
-是为了遇到没预料到的错误时默认行为是「跳过继续」，绝不会卡在未知情况上。
+**除了确定无法恢复的 HTTP 4xx（除 429）和本地文件系统错误，分片传输失败默认都会重试。**
+每次尝试都有空闲超时和硬上限，所以重试未识别的瞬时链路错误也不会无限卡住。
 
 | 重试 | 不重试 |
 |---|---|
 | HTTP 5xx（服务端临时故障） | HTTP 4xx（**含 478 资源已删除**）、404、403 |
-| HTTP 429（限流，退避后可能就好） | 任何超时 / 连接黑洞（一次 11~15s，重试代价高） |
-| 瞬时网络错误（ECONNRESET / socket hang up） | 耗时超过 8s 的失败 |
-| DNS 临时失败（EAI_AGAIN） | **任何未识别的错误类型**（记录为「其他: xxx」） |
+| HTTP 429（限流，退避后可能就好） | 本地磁盘/权限错误（ENOSPC / EACCES / EROFS 等） |
+| 超时、ECONNRESET、socket hang up |  |
+| HTTP/2 流错误（ERR_HTTP2_STREAM_ERROR / NGHTTP2_*） |  |
+| DNS 失败及其他传输层错误 |  |
 
 > `478` 是这个 CDN 对「资源不存在」的自定义码。实测依据：30 路并发请求真实分片全部返回 200
 > （排除限流），假的路径/目录才返回 478，响应体恒为 46 字节；且单次耗时 1.0~2.0s
